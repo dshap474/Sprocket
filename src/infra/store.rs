@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use base64::Engine;
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::domain::manager::ManagerState;
@@ -118,11 +119,12 @@ impl TurnStore {
     }
 
     pub fn session_dir(&self, session_id: &str) -> PathBuf {
-        self.root.join(session_id)
+        self.root.join(encode_runtime_key(session_id))
     }
 
     fn path(&self, session_id: &str, turn_id: &str) -> PathBuf {
-        self.session_dir(session_id).join(format!("{turn_id}.json"))
+        self.session_dir(session_id)
+            .join(format!("{}.json", encode_runtime_key(turn_id)))
     }
 }
 
@@ -159,7 +161,8 @@ impl SessionStore {
     }
 
     fn path(&self, session_id: &str) -> PathBuf {
-        self.root.join(format!("{session_id}.json"))
+        self.root
+            .join(format!("{}.json", encode_runtime_key(session_id)))
     }
 }
 
@@ -185,4 +188,11 @@ pub fn save_toml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let mut content = toml::to_string_pretty(value)?;
     content.push('\n');
     crate::infra::atomic_write::atomic_write_bytes(path, content.as_bytes())
+}
+
+pub(crate) fn encode_runtime_key(value: &str) -> String {
+    format!(
+        "k-{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.as_bytes())
+    )
 }

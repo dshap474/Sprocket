@@ -12,7 +12,7 @@ impl RepoPath {
         Self(BString::from(bytes))
     }
 
-    pub fn from_str(value: &str) -> Self {
+    pub fn from_utf8(value: &str) -> Self {
         Self(BString::from(value.as_bytes().to_vec()))
     }
 
@@ -33,7 +33,7 @@ impl RepoPath {
         {
             use std::os::unix::ffi::OsStrExt;
 
-            return root.join(OsStr::from_bytes(self.as_bytes()));
+            root.join(OsStr::from_bytes(self.as_bytes()))
         }
         #[cfg(not(unix))]
         {
@@ -46,7 +46,7 @@ impl RepoPath {
         {
             use std::os::unix::ffi::OsStringExt;
 
-            return OsString::from_vec(self.as_bytes().to_vec());
+            OsString::from_vec(self.as_bytes().to_vec())
         }
         #[cfg(not(unix))]
         {
@@ -57,6 +57,6 @@ impl RepoPath {
 
 impl From<&str> for RepoPath {
     fn from(value: &str) -> Self {
-        Self::from_str(value)
+        Self::from_utf8(value)
     }
 }

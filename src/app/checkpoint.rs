@@ -3,6 +3,7 @@ use std::time::Duration;
 use anyhow::Result;
 use serde_json::Value;
 
+use crate::app::support::{ensure_supported_repo, load_policy};
 use crate::cli::resolve_repo_from_target;
 use crate::codex::payload::{cwd, session_id, turn_id};
 use crate::codex::responses::emit_stop_block;
@@ -21,18 +22,22 @@ use crate::infra::clock::{Clock, SystemClock};
 use crate::infra::git::GitBackend;
 use crate::infra::git_cli::GitCli;
 use crate::infra::lock::RepoLock;
-use crate::infra::store::{RuntimeLayout, Stores, load_toml};
+use crate::infra::store::{RuntimeLayout, Stores};
 
 pub fn run(payload: &Value) -> Result<()> {
     let clock = SystemClock;
+    let now = clock.now_unix();
     let cwd = cwd(payload).unwrap_or(std::env::current_dir()?);
     let repo = resolve_repo_from_target(Some(&cwd))?;
     let git = GitCli::discover(&repo)?;
-    let policy: Policy = load_toml(&git.repo_root().join(".sprocket/policy.toml"))
-        .unwrap_or_else(|_| Policy::default());
     let (head, stream) = resolve_stream(&git)?;
     let runtime = RuntimeLayout::from_git(&git)?;
     let stores = Stores::for_stream(runtime, &stream.stream_id);
+    let policy = load_policy(&git, &stores, &stream, "checkpoint", now)?;
+    let repo_state = git.repo_state()?;
+    if !ensure_supported_repo(&stores, &stream, "checkpoint", now, &repo_state, &policy)? {
+        return Ok(());
+    }
 
     let _lock = match RepoLock::try_acquire(
         &stores.lock_path,
@@ -42,9 +47,8 @@ pub fn run(payload: &Value) -> Result<()> {
         None => return Ok(()),
     };
 
-    let now = clock.now_unix();
     let mut manager = ensure_stream_initialized(&git, &stores, &stream, &head, now, &policy)?;
-    let Some(turn) = stores.turns.load(&session_id(payload), &turn_id(payload))? else {
+    let Some(mut turn) = stores.turns.load(&session_id(payload), &turn_id(payload))? else {
         return Ok(());
     };
     if turn.stream_id_at_start != stream.stream_id {
@@ -61,6 +65,27 @@ pub fn run(payload: &Value) -> Result<()> {
     let changed_paths =
         crate::domain::delta::changed_path_count(&anchor_snapshot.entries, &snapshot.entries)
             as u32;
+
+    if let Some(hidden_commit_oid) = turn.pending_promotion_commit_oid.clone() {
+        if hidden_commit_oid == manager.anchor.checkpoint_commit_oid
+            && snapshot.fingerprint == manager.anchor.fingerprint
+        {
+            return finish_promotion_attempt(PromotionAttemptContext {
+                git: &git,
+                stores: &stores,
+                policy: &policy,
+                repo_state: &repo_state,
+                head: &head,
+                stream: &stream,
+                turn: &turn,
+                now,
+                hidden_commit_oid: &hidden_commit_oid,
+            });
+        }
+
+        turn.pending_promotion_commit_oid = None;
+        stores.turns.save(&turn)?;
+    }
 
     let decision = classify(&ClassifyInput {
         stream_id_now: &stream.stream_id,
@@ -151,30 +176,32 @@ pub fn run(payload: &Value) -> Result<()> {
             manager.pending = None;
             manager.last_seen = Some(last_seen(&snapshot, now, &head));
             stores.manager.save(&manager)?;
-            stores.turns.delete(&turn.session_id, &turn.turn_id)?;
+            turn.pending_promotion_commit_oid = Some(commit_oid.clone());
+            stores.turns.save(&turn)?;
 
-            match maybe_promote_visible(
-                &git,
-                &policy,
-                &git.repo_state()?,
-                &head,
-                &commit_oid,
-                &stream,
-            )? {
+            match maybe_promote_visible(&git, &policy, &repo_state, &head, &commit_oid, &stream)? {
                 PromotionOutcome::Skipped(reason) => {
+                    stores.turns.delete(&turn.session_id, &turn.turn_id)?;
                     stores.journal.append(&JournalEvent::PromotionSkipped {
                         ts: now,
                         stream_id: stream.stream_id.clone(),
                         reason,
                     })?;
+                    ("materialized".to_string(), Some(source), Some(commit_oid))
                 }
                 PromotionOutcome::Blocked(reason) => {
                     emit_stop_block(&reason)?;
+                    (
+                        "materialized-blocked".to_string(),
+                        Some(source),
+                        Some(commit_oid),
+                    )
                 }
-                PromotionOutcome::Promoted(_) => {}
+                PromotionOutcome::Promoted(_) => {
+                    stores.turns.delete(&turn.session_id, &turn.turn_id)?;
+                    ("materialized".to_string(), Some(source), Some(commit_oid))
+                }
             }
-
-            ("materialized".to_string(), Some(source), Some(commit_oid))
         }
     };
 
@@ -186,6 +213,62 @@ pub fn run(payload: &Value) -> Result<()> {
         outcome,
         source,
         commit_oid,
+    })?;
+    Ok(())
+}
+
+struct PromotionAttemptContext<'a> {
+    git: &'a dyn GitBackend,
+    stores: &'a Stores,
+    policy: &'a Policy,
+    repo_state: &'a crate::domain::session::RepoState,
+    head: &'a crate::domain::session::HeadState,
+    stream: &'a crate::domain::session::StreamIdentity,
+    turn: &'a crate::domain::turn::TurnState,
+    now: i64,
+    hidden_commit_oid: &'a str,
+}
+
+fn finish_promotion_attempt(ctx: PromotionAttemptContext<'_>) -> Result<()> {
+    let outcome = match maybe_promote_visible(
+        ctx.git,
+        ctx.policy,
+        ctx.repo_state,
+        ctx.head,
+        ctx.hidden_commit_oid,
+        ctx.stream,
+    )? {
+        PromotionOutcome::Skipped(reason) => {
+            ctx.stores
+                .turns
+                .delete(&ctx.turn.session_id, &ctx.turn.turn_id)?;
+            ctx.stores.journal.append(&JournalEvent::PromotionSkipped {
+                ts: ctx.now,
+                stream_id: ctx.stream.stream_id.clone(),
+                reason,
+            })?;
+            "materialized".to_string()
+        }
+        PromotionOutcome::Blocked(reason) => {
+            emit_stop_block(&reason)?;
+            "materialized-blocked".to_string()
+        }
+        PromotionOutcome::Promoted(_) => {
+            ctx.stores
+                .turns
+                .delete(&ctx.turn.session_id, &ctx.turn.turn_id)?;
+            "materialized".to_string()
+        }
+    };
+
+    ctx.stores.journal.append(&JournalEvent::StopDecision {
+        ts: ctx.now,
+        session_id: ctx.turn.session_id.clone(),
+        turn_id: ctx.turn.turn_id.clone(),
+        stream_id: ctx.stream.stream_id.clone(),
+        outcome,
+        source: None,
+        commit_oid: Some(ctx.hidden_commit_oid.to_string()),
     })?;
     Ok(())
 }

@@ -1,7 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-use crate::domain::repopath::RepoPath;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Policy {
@@ -55,7 +53,7 @@ pub struct GuardPolicy {
     pub git_prepare_commit_msg: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct CompatPolicy {
     pub allow_sparse_checkout: bool,
@@ -126,17 +124,11 @@ impl Default for GuardPolicy {
     }
 }
 
-impl Default for CompatPolicy {
-    fn default() -> Self {
-        Self {
-            allow_sparse_checkout: false,
-        }
-    }
-}
-
 impl Policy {
-    pub fn git_include_pathspecs(&self) -> Vec<String> {
-        self.owned.include.clone()
+    pub fn git_owned_pathspecs(&self) -> Vec<String> {
+        let mut pathspecs = self.owned.include.clone();
+        pathspecs.extend(self.owned.exclude.iter().cloned());
+        pathspecs
     }
 
     pub fn checkpoint_subject(&self) -> String {
@@ -144,32 +136,4 @@ impl Policy {
             .message_template
             .replace("{area}", &self.checkpoint.default_area)
     }
-
-    pub fn is_owned_path(&self, path: &RepoPath) -> bool {
-        let lossy = path.display_lossy();
-        let included = self
-            .owned
-            .include
-            .iter()
-            .any(|rule| matches_rule(&lossy, strip_rule_prefix(rule)));
-        let excluded = self
-            .owned
-            .exclude
-            .iter()
-            .any(|rule| matches_rule(&lossy, strip_rule_prefix(rule)));
-        included && !excluded
-    }
-}
-
-fn strip_rule_prefix(rule: &str) -> &str {
-    rule.strip_prefix(":(exclude)")
-        .unwrap_or(rule)
-        .trim_matches('/')
-}
-
-fn matches_rule(path: &str, rule: &str) -> bool {
-    if rule.is_empty() || rule == "." {
-        return true;
-    }
-    path == rule || path.starts_with(&format!("{rule}/"))
 }
