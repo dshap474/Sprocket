@@ -80,10 +80,12 @@ pub fn run(payload: &Value) -> Result<()> {
                 turn: &turn,
                 now,
                 hidden_commit_oid: &hidden_commit_oid,
+                expected_head_oid: turn.pending_promotion_head_oid.as_deref(),
             });
         }
 
         turn.pending_promotion_commit_oid = None;
+        turn.pending_promotion_head_oid = None;
         stores.turns.save(&turn)?;
     }
 
@@ -177,9 +179,18 @@ pub fn run(payload: &Value) -> Result<()> {
             manager.last_seen = Some(last_seen(&snapshot, now, &head));
             stores.manager.save(&manager)?;
             turn.pending_promotion_commit_oid = Some(commit_oid.clone());
+            turn.pending_promotion_head_oid = head.oid.clone();
             stores.turns.save(&turn)?;
 
-            match maybe_promote_visible(&git, &policy, &repo_state, &head, &commit_oid, &stream)? {
+            match maybe_promote_visible(
+                &git,
+                &policy,
+                &repo_state,
+                &head,
+                head.oid.as_deref(),
+                &commit_oid,
+                &stream,
+            )? {
                 PromotionOutcome::Skipped(reason) => {
                     stores.turns.delete(&turn.session_id, &turn.turn_id)?;
                     stores.journal.append(&JournalEvent::PromotionSkipped {
@@ -227,6 +238,7 @@ struct PromotionAttemptContext<'a> {
     turn: &'a crate::domain::turn::TurnState,
     now: i64,
     hidden_commit_oid: &'a str,
+    expected_head_oid: Option<&'a str>,
 }
 
 fn finish_promotion_attempt(ctx: PromotionAttemptContext<'_>) -> Result<()> {
@@ -235,6 +247,7 @@ fn finish_promotion_attempt(ctx: PromotionAttemptContext<'_>) -> Result<()> {
         ctx.policy,
         ctx.repo_state,
         ctx.head,
+        ctx.expected_head_oid,
         ctx.hidden_commit_oid,
         ctx.stream,
     )? {

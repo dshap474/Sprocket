@@ -17,20 +17,35 @@ pub struct TestRepo {
 
 impl TestRepo {
     pub fn new() -> Self {
+        Self::new_with_init_args(&["init"])
+    }
+
+    pub fn try_new_with_init_args(init_args: &[&str]) -> Option<Self> {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("repo");
         fs::create_dir_all(&root).unwrap();
         let hermetic = HermeticEnv::new(dir.path());
         hermetic.ensure_dirs();
+        let output = Command::new("git")
+            .args(init_args)
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            return None;
+        }
         let repo = Self {
             _dir: dir,
             root,
             hermetic,
         };
-        repo.git(&["init"]);
         repo.git(&["config", "user.name", "Test User"]);
         repo.git(&["config", "user.email", "test@example.com"]);
-        repo
+        Some(repo)
+    }
+
+    pub fn new_with_init_args(init_args: &[&str]) -> Self {
+        Self::try_new_with_init_args(init_args).unwrap()
     }
 
     pub fn for_existing(root: PathBuf, hermetic: HermeticEnv) -> Self {
@@ -86,6 +101,14 @@ impl TestRepo {
 
     pub fn git(&self, args: &[&str]) -> String {
         run_git(&self.root, args)
+    }
+
+    pub fn git_output(&self, args: &[&str]) -> std::process::Output {
+        Command::new("git")
+            .args(args)
+            .current_dir(&self.root)
+            .output()
+            .unwrap()
     }
 
     pub fn git_path(&self, name: &str) -> PathBuf {

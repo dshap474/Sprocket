@@ -5,7 +5,7 @@ use sprocket::domain::ids::compute_stream_identity;
 use sprocket::infra::git::GitBackend;
 use sprocket::infra::git_cli::GitCli;
 
-use support::assertions::{head_file, manager_for_stream, stream_root};
+use support::assertions::{head_file, manager_for_stream, read_journal, stream_root};
 use support::cmd::run;
 use support::payloads;
 use support::repo::TestRepo;
@@ -262,4 +262,118 @@ fn index_sync_failure_does_not_advance_head() {
     .assert_success();
 
     assert_eq!(head_file(&repo, "HEAD:src/lib.rs"), "pub fn a() {}");
+}
+
+#[test]
+fn resumed_promotion_skips_if_head_moved_since_block() {
+    let repo = TestRepo::new();
+    repo.write("src/lib.rs", "pub fn a() {}\n");
+    repo.commit_all("init");
+    set_policy(&repo, &promotion_policy(&["false"], false));
+
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "session-start"],
+        Some(&payloads::session_start(&repo.root, "s1")),
+        &[],
+    )
+    .assert_success();
+    repo.write("src/lib.rs", "pub fn a() { println!(\"hidden\"); }\n");
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "baseline"],
+        Some(&payloads::baseline(&repo.root, "s1", "t1")),
+        &[],
+    )
+    .assert_success();
+    let blocked = run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "checkpoint"],
+        Some(&payloads::checkpoint(&repo.root, "s1", "t1")),
+        &[],
+    );
+    blocked.assert_success();
+    assert!(blocked.stdout_string().contains("\"decision\":\"block\""));
+
+    repo.git(&["commit", "--allow-empty", "-m", "manual follow-up"]);
+    set_policy(&repo, &promotion_policy(&[], true));
+
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "checkpoint"],
+        Some(&payloads::checkpoint(&repo.root, "s1", "t1")),
+        &[],
+    )
+    .assert_success();
+
+    let (stream, manager) = stream_state(&repo);
+    let journal = read_journal(&stream_root(&repo, &stream.stream_id));
+    assert_eq!(head_file(&repo, "HEAD:src/lib.rs"), "pub fn a() {}");
+    assert_eq!(manager.generation, 2);
+    assert!(journal.iter().any(|event| matches!(
+        event,
+        sprocket::domain::journal::JournalEvent::PromotionSkipped { reason, .. } if reason == "head-moved"
+    )));
+}
+
+fn assert_blocked_by_repo_state(marker: &str, expected_reason: &str) {
+    let repo = TestRepo::new();
+    repo.write("src/lib.rs", "pub fn a() {}\n");
+    repo.commit_all("init");
+    set_policy(&repo, &promotion_policy(&[], true));
+
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "session-start"],
+        Some(&payloads::session_start(&repo.root, "s1")),
+        &[],
+    )
+    .assert_success();
+    repo.write("src/lib.rs", "pub fn a() { println!(\"x\"); }\n");
+    let marker_path = repo.git_path(marker);
+    if marker.ends_with('/') {
+        std::fs::create_dir_all(&marker_path).unwrap();
+    } else {
+        if let Some(parent) = marker_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&marker_path, b"state\n").unwrap();
+    }
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "baseline"],
+        Some(&payloads::baseline(&repo.root, "s1", "t1")),
+        &[],
+    )
+    .assert_success();
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "checkpoint"],
+        Some(&payloads::checkpoint(&repo.root, "s1", "t1")),
+        &[],
+    )
+    .assert_success();
+
+    let (stream, manager) = stream_state(&repo);
+    let journal = read_journal(&stream_root(&repo, &stream.stream_id));
+    assert_eq!(manager.generation, 2);
+    assert_eq!(head_file(&repo, "HEAD:src/lib.rs"), "pub fn a() {}");
+    assert!(journal.iter().any(|event| matches!(
+        event,
+        sprocket::domain::journal::JournalEvent::PromotionSkipped { reason, .. } if reason == expected_reason
+    )));
+}
+
+#[test]
+fn merge_rebase_and_cherry_pick_states_skip_promotion() {
+    assert_blocked_by_repo_state("MERGE_HEAD", "merge-in-progress");
+    assert_blocked_by_repo_state("rebase-merge", "rebase-in-progress");
+    assert_blocked_by_repo_state("CHERRY_PICK_HEAD", "cherry-pick-in-progress");
 }

@@ -11,4 +11,6 @@ pub struct TurnState {
     pub baseline_manifest_id: String,
     pub anchor_fingerprint_at_start: String,
     pub anchor_manifest_id_at_start: String,
+    pub pending_promotion_commit_oid: Option<String>,
+    pub pending_promotion_head_oid: Option<String>,
 }

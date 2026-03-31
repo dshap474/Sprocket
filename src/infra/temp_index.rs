@@ -1,18 +1,18 @@
 use std::path::{Path, PathBuf};
 
-use tempfile::NamedTempFile;
+use tempfile::TempDir;
 
 #[derive(Debug)]
 pub struct TempIndex {
-    _file: NamedTempFile,
+    _dir: TempDir,
     path: PathBuf,
 }
 
 impl TempIndex {
     pub fn new() -> anyhow::Result<Self> {
-        let file = NamedTempFile::new()?;
-        let path = file.path().to_path_buf();
-        Ok(Self { _file: file, path })
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("index");
+        Ok(Self { _dir: dir, path })
     }
 
     pub fn path(&self) -> &Path {

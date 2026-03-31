@@ -27,6 +27,15 @@ fn malformed_policy_fails_closed() {
     );
     assert!(!output.output.status.success());
     assert!(output.stderr_string().contains("failed to load"));
+
+    let git = GitCli::discover(&repo.root).unwrap();
+    let stream = compute_stream_identity(&repo.root, &git.head_state().unwrap());
+    let journal = read_journal(&stream_root(&repo, &stream.stream_id));
+    assert!(journal.iter().any(|event| matches!(
+        event,
+        sprocket::domain::journal::JournalEvent::HookError { hook, reason, .. }
+            if hook == "session-start" && reason.contains("invalid-policy")
+    )));
 }
 
 #[test]
@@ -204,10 +213,80 @@ continue_on_failure = true
     let journal = read_journal(&stream_root(&repo, &stream.stream_id));
     assert!(journal.iter().any(|event| matches!(
         event,
-        sprocket::domain::journal::JournalEvent::HookNoop { .. }
+        sprocket::domain::journal::JournalEvent::HookNoop { hook, reason, .. }
+            if hook == "session-start" && reason == "sparse-checkout-unsupported"
     )));
     assert!(journal.iter().any(|event| matches!(
         event,
-        sprocket::domain::journal::JournalEvent::PromotionSkipped { .. }
+        sprocket::domain::journal::JournalEvent::PromotionSkipped { reason, .. }
+            if reason == "foreign-staged-changes"
     )));
+}
+
+#[test]
+fn payload_variants_are_accepted() {
+    let repo = TestRepo::new();
+    repo.write("src/lib.rs", "pub fn a() {}\n");
+    repo.commit_all("init");
+
+    let session_payload = serde_json::json!({
+        "workingDirectory": repo.root.display().to_string(),
+        "sessionId": "camel-session",
+    });
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "session-start"],
+        Some(&session_payload),
+        &[],
+    )
+    .assert_success();
+
+    let baseline_payload = serde_json::json!({
+        "working_dir": repo.root.display().to_string(),
+        "sessionId": "camel-session",
+        "requestId": "camel-turn",
+    });
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "baseline"],
+        Some(&baseline_payload),
+        &[],
+    )
+    .assert_success();
+
+    let pretool_payload = serde_json::json!({
+        "workingDirectory": repo.root.display().to_string(),
+        "toolInput": {
+            "command": "git reset --hard HEAD"
+        }
+    });
+    let pretool = run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "pre-tool-use"],
+        Some(&pretool_payload),
+        &[],
+    );
+    pretool.assert_success();
+    assert!(
+        pretool
+            .stdout_string()
+            .contains("\"permissionDecision\":\"deny\"")
+    );
+
+    let checkpoint_payload = serde_json::json!({
+        "working_dir": repo.root.display().to_string(),
+        "sessionId": "camel-session",
+        "requestId": "camel-turn",
+    });
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "checkpoint"],
+        Some(&checkpoint_payload),
+        &[],
+    )
+    .assert_success();
 }
