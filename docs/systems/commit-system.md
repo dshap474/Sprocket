@@ -1,44 +1,47 @@
 # Sprocket Commit System
 
-This document is the master technical spec for Sprocket's first commit-core backend: the Codex smart local commit system.
+This is the master technical spec for Sprocket's current Codex commit system.
 
-It is written so another engineer can recreate the system from scratch without needing to reverse-engineer the codebase.
+It is written so another engineer can recreate the system from scratch without reverse-engineering the codebase.
 
 The current implementation lives in:
 
 - [src/lib.rs](/Users/daniel/Developer/Sprocket/src/lib.rs)
+- [src/config.rs](/Users/daniel/Developer/Sprocket/src/config.rs)
+- [src/classification.rs](/Users/daniel/Developer/Sprocket/src/classification.rs)
+- [src/docs_worker.rs](/Users/daniel/Developer/Sprocket/src/docs_worker.rs)
 - [src/main.rs](/Users/daniel/Developer/Sprocket/src/main.rs)
 
 ## 1. Purpose
 
-The system exists to give Codex a safe, bounded, local-only autosave mechanism.
+The system gives Codex a safe, bounded, local-only commit path with milestone-gated docs maintenance.
 
-It does four things:
+It does five things:
 
 1. installs Codex hook wiring into a repo
 2. snapshots the meaningful repo state at the start of a turn
-3. decides at the end of a turn whether a checkpoint commit should be created
-4. blocks direct git mutation commands from the agent so Sprocket remains the sole commit path
+3. classifies end-of-turn work as `none`, `checkpoint`, or `milestone`
+4. runs a synchronous docs worker before milestone commits
+5. blocks direct git mutation commands so Sprocket remains the only blessed autosave path
 
-This milestone is intentionally narrow.
-
-It does **not** include:
+It still does **not** include:
 
 - startup dirty-state adoption
-- milestone docs refresh
 - stale-session warnings
-- Python profile logic
 - multi-backend support beyond Codex
+- profile-specific language semantics beyond the generic trigger defaults
 
 ## 2. System Boundary
 
-The design has a strict split between the product runtime and the Codex adapter.
+Sprocket keeps a strict split between product state and backend adapter state.
 
 ### Canonical product home
 
 Sprocket owns:
 
 - `/.sprocket/sprocket.toml`
+- `/.sprocket/rules/project.md`
+- `/.sprocket/rules/architecture.md`
 - `/.sprocket/state/...`
 
 ### Backend adapter layer
@@ -47,7 +50,7 @@ Codex owns:
 
 - `/.codex/hooks.json`
 
-Sprocket writes into `/.codex/hooks.json`, but `/.codex/` is not the product's canonical home. It is only the Codex-facing adapter surface.
+Sprocket writes into `/.codex/hooks.json`, but `/.codex/` is adapter wiring only.
 
 ## 3. Repo Contract
 
@@ -58,6 +61,9 @@ repo/
 ├── .codex/
 │   └── hooks.json
 ├── .sprocket/
+│   ├── rules/
+│   │   ├── architecture.md
+│   │   └── project.md
 │   ├── sprocket.toml
 │   └── state/
 │       └── checkpoint/
@@ -68,15 +74,22 @@ repo/
 └── .gitignore
 ```
 
-Sprocket also appends this ignore rule if missing:
+Sprocket also appends:
 
 ```gitignore
 .sprocket/state/
 ```
 
-## 4. CLI Surface
+The docs worker may later create and maintain:
 
-The first backend-facing command surface is:
+- `docs/ARCHITECTURE.md`
+- `docs/project/llms/llms.txt`
+
+Those paths are configurable, but they are the built-in defaults.
+
+## 4. Public CLI Surface
+
+The current public CLI is:
 
 ```text
 sprocket install codex
@@ -85,7 +98,7 @@ sprocket hook codex pre-tool-use
 sprocket hook codex checkpoint
 ```
 
-The main binary is only a thin CLI wrapper:
+The binary entrypoint is intentionally thin:
 
 ```rust
 fn main() {
@@ -104,14 +117,13 @@ fn main() {
 
 `sprocket install codex` does the following:
 
-1. resolves the target repo root via `git rev-parse --show-toplevel`
+1. resolves the target repo root with `git rev-parse --show-toplevel`
 2. resolves the current Sprocket binary path with `current_exe()`
-3. creates `/.sprocket/` state directories
+3. creates `/.sprocket/state/checkpoint/turns`
 4. writes or updates `/.sprocket/sprocket.toml`
-5. appends `.sprocket/state/` to `.gitignore` if needed
-6. creates or safely merges `/.codex/hooks.json`
-
-### Install algorithm
+5. writes `/.sprocket/rules/project.md` and `/.sprocket/rules/architecture.md`
+6. appends `.sprocket/state/` to `.gitignore` if needed
+7. creates or safely merges `/.codex/hooks.json`
 
 ```mermaid
 flowchart TD
@@ -119,11 +131,12 @@ flowchart TD
     B --> C["Resolve current binary path"]
     C --> D["Create /.sprocket/state/checkpoint/turns"]
     D --> E["Write or update /.sprocket/sprocket.toml"]
-    E --> F["Ensure .gitignore contains .sprocket/state/"]
-    F --> G["Read /.codex/hooks.json or create empty JSON root"]
-    G --> H["Remove only Sprocket-managed hook groups"]
-    H --> I["Append generated UserPromptSubmit / PreToolUse / Stop groups"]
-    I --> J["Write merged /.codex/hooks.json"]
+    E --> F["Write /.sprocket/rules/*.md"]
+    F --> G["Ensure .gitignore contains .sprocket/state/"]
+    G --> H["Read /.codex/hooks.json or create empty JSON root"]
+    H --> I["Remove only Sprocket-managed hook groups"]
+    I --> J["Append generated UserPromptSubmit / PreToolUse / Stop groups"]
+    J --> K["Write merged /.codex/hooks.json"]
 ```
 
 ## 6. Generated Codex Hook Wiring
@@ -132,7 +145,7 @@ Sprocket installs three Codex events.
 
 ### `UserPromptSubmit`
 
-Runs the baseline capture step:
+Captures the baseline snapshot:
 
 ```json
 {
@@ -147,7 +160,7 @@ Runs the baseline capture step:
 
 ### `PreToolUse` on `Bash`
 
-Runs the git mutation guard:
+Blocks direct git mutation commands:
 
 ```json
 {
@@ -163,7 +176,7 @@ Runs the git mutation guard:
 
 ### `Stop`
 
-Runs checkpoint evaluation:
+Runs the commit classifier and optional docs worker:
 
 ```json
 {
@@ -188,27 +201,19 @@ The merge rule is:
 - delete only groups whose nested hook commands contain the stable marker `--sprocket-managed`
 - append the new Sprocket-managed group for each event
 
-That makes reinstall idempotent without owning the whole `hooks.json` file.
-
-### Why the hidden marker exists
-
-The marker is not the binary name. It is a stable flag:
+The marker is intentionally path-stable:
 
 ```rust
 const SPROCKET_HOOK_MARKER: &str = "--sprocket-managed";
 ```
 
-That matters because:
-
-- `current_exe()` differs in tests vs normal runs
-- binary names can vary by install path
-- hook ownership must remain detectable even when the binary path changes
-
-The CLI strips this flag before dispatching commands, so it is only there for hook ownership and hook identification.
+That avoids coupling hook ownership to the current binary path.
 
 ## 8. Config Model
 
-The first config is intentionally small.
+The repo-local source of truth is `/.sprocket/sprocket.toml`.
+
+Current shape:
 
 ```toml
 version = 1
@@ -221,28 +226,47 @@ owned_paths = ["src", "tests"]
 checkpoint_turn_threshold = 2
 checkpoint_file_threshold = 3
 checkpoint_age_minutes = 20
+milestone_file_threshold = 6
 lock_timeout_seconds = 300
 default_area = "core"
-message_template = "checkpoint({area}): save current work [auto]"
+checkpoint_message_template = "checkpoint({area}): save current work [auto]"
+milestone_message_template = "milestone({area}): sync docs and save current work [auto]"
+
+[docs]
+enabled = true
+managed_outputs = ["docs/ARCHITECTURE.md", "docs/project/llms/llms.txt"]
+timeout_seconds = 90
+model = "gpt-5.3-codex-spark"
+reasoning_effort = "medium"
+sandbox = "workspace-write"
+approval = "never"
+disable_codex_hooks = true
+recreate_missing = true
+instructions = ""
+
+[docs.triggers]
+source_roots = ["src"]
+test_roots = ["tests"]
+milestone_globs = [
+  "pyproject.toml",
+  "package.json",
+  "Cargo.toml",
+  "justfile",
+  "Makefile",
+  "Dockerfile",
+  ".github/workflows/**",
+]
 ```
 
-### Config responsibilities
+Important validation rule:
 
-`backend.codex.binary_path`
-- records which binary path the repo is currently wired to
+- `docs.managed_outputs` must not overlap `commit.owned_paths`
 
-`commit.owned_paths`
-- defines which paths are meaningful for baseline snapshots and eligible for auto-commit staging
-
-`commit.*thresholds`
-- control when a turn becomes a checkpoint
-
-`commit.message_template`
-- allows commit message construction without hardcoding the full message forever
+That prevents docs maintenance from self-triggering commit loops.
 
 ## 9. State Model
 
-The system uses two persisted state files.
+The runtime persists two state files.
 
 ### Manager state
 
@@ -252,23 +276,21 @@ Path:
 /.sprocket/state/checkpoint/manager.json
 ```
 
-Fields:
+Important fields:
 
-- `version`
 - `generation`
 - `last_checkpoint_fingerprint`
 - `last_checkpoint_manifest`
 - `last_checkpoint_commit`
 - `last_checkpoint_at`
+- `last_milestone_fingerprint`
+- `last_milestone_manifest`
 - `pending_turn_count`
 - `pending_first_seen_at`
 - `pending_last_seen_at`
-
-Purpose:
-
-- tracks the repo’s last committed meaningful state
-- tracks checkpoint cadence
-- increments `generation` every time Sprocket creates a checkpoint commit
+- `docs_backlog`
+- `last_docs_attempt_at`
+- `last_docs_error`
 
 ### Turn state
 
@@ -280,403 +302,187 @@ Path:
 
 Fields:
 
-- `version`
 - `turn_id`
 - `started_at`
 - `baseline_fingerprint`
 - `baseline_manifest`
 
-Purpose:
-
-- stores the baseline meaningful state captured at `UserPromptSubmit`
-- lets `Stop` compare “state at turn start” vs “state at turn end”
+The turn file is ephemeral and removed when the `Stop` hook finishes handling that turn.
 
 ## 10. Meaningful Snapshot Model
 
-The commit system does not inspect the whole repo. It only looks at configured owned paths.
+Baseline and checkpoint diffs only look at `commit.owned_paths`.
 
-The snapshot algorithm is:
+That means:
 
-1. ask git for tracked files under owned paths
-2. ask git for deleted files under owned paths
-3. ask git for untracked files under owned paths
-4. build a manifest of present files and deleted paths
-5. hash the manifest into a stable fingerprint
+- code changes inside the owned surface can trigger commits
+- docs outputs are not part of the fingerprint basis
+- changes only to docs outputs do not create new auto-commits
 
-Present manifest entries look like:
-
-```json
-{
-  "path": "src/main.py",
-  "status": "present",
-  "sha256": "<file-digest>"
-}
-```
-
-Deleted manifest entries look like:
-
-```json
-{
-  "path": "tests/test_main.py",
-  "status": "deleted"
-}
-```
-
-The fingerprint is:
-
-```text
-sha256:<hash of serialized manifest>
-```
-
-### Why this design works
-
-- tracked + untracked files matter because Codex may create new files
-- deletions matter because removing files is meaningful work
-- hashing the manifest gives a compact stable identity for state comparisons
-
-## 11. Baseline Hook Behavior
-
-The baseline hook is triggered by `UserPromptSubmit`.
-
-It does three things:
-
-1. computes the current meaningful snapshot
-2. initializes manager baseline if none exists yet
-3. writes the turn state for the current turn
-
-### Important bootstrap behavior
-
-The first time the repo uses Sprocket, there may be no checkpoint baseline yet.
-
-Without special handling, the first checkpoint diff would compare against an empty manifest and incorrectly treat the whole repo as new work.
-
-So baseline capture initializes manager state like this when empty:
+The snapshot manifest stores per-path status and content hash:
 
 ```rust
-if manager.last_checkpoint_fingerprint.is_none() {
-    manager.last_checkpoint_fingerprint = Some(snapshot.fingerprint.clone());
-    manager.last_checkpoint_manifest = snapshot.manifest.clone();
-    manager.last_checkpoint_commit = current_head(&repo)?;
-    manager.last_checkpoint_at = Some(now_unix_seconds());
-    save_manager_state(&repo, &manager)?;
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ManifestEntry {
+    path: String,
+    status: String,
+    sha256: Option<String>,
 }
 ```
 
-That makes the current repo state the starting baseline instead of forcing a bogus first autosave.
+## 11. Classification Model
 
-## 12. Stop Hook Behavior
+The `Stop` hook compares:
 
-The checkpoint hook runs at `Stop`.
+- current snapshot vs turn baseline
+- current snapshot vs last checkpoint baseline
+- current manifest vs last checkpoint manifest
 
-Its job is to decide whether the turn should produce a local checkpoint commit.
-
-### High-level algorithm
-
-```mermaid
-sequenceDiagram
-    participant Codex
-    participant Hook as Stop Hook
-    participant Repo as Repo State
-    participant State as /.sprocket/state
-    participant Git
-
-    Codex->>Hook: Stop event payload
-    Hook->>Repo: Resolve repo root
-    Hook->>State: Load turn state
-    Hook->>Repo: Compute current snapshot
-    alt Snapshot unchanged since turn start
-        Hook->>State: Delete turn state
-        Hook-->>Codex: no-op
-    else Snapshot changed
-        Hook->>State: Acquire repo lock
-        Hook->>State: Load manager state
-        Hook->>Hook: Diff current snapshot vs last checkpoint manifest
-        alt Not yet a checkpoint
-            Hook->>State: Increment pending_turn_count
-            Hook->>State: Save manager state
-            Hook->>State: Delete turn state
-            Hook-->>Codex: no-op
-        else Checkpoint threshold reached
-            Hook->>Git: Stage only owned paths
-            Hook->>Git: Commit staged owned files
-            Hook->>State: Update manager baseline and generation
-            Hook->>State: Delete turn state
-            Hook-->>Codex: success
-        end
-    end
-```
-
-### Early exit conditions
-
-The hook no-ops when:
-
-- no turn state exists
-- current fingerprint equals turn baseline fingerprint
-- current fingerprint already equals last checkpoint fingerprint
-- the owned path stage step yields no staged changes
-
-## 13. Delta Computation
-
-The system diffs:
-
-- `manager.last_checkpoint_manifest`
-- current snapshot manifest
-
-The diff produces:
-
-- `added`
-- `modified`
-- `deleted`
-- `changed_paths`
-
-This is enough for v1 because the system only classifies:
+Then it classifies the turn as:
 
 - `none`
 - `checkpoint`
+- `milestone`
 
-There is no `milestone` class yet.
+Classification order:
 
-## 14. Checkpoint Classification
+1. `none` if current fingerprint equals the turn baseline
+2. `none` if current fingerprint equals the last checkpoint fingerprint
+3. compute manifest delta
+4. `none` if delta is empty
+5. `milestone` if `docs_backlog = true`
+6. `milestone` if `changed_file_count >= milestone_file_threshold`
+7. `milestone` if any changed path matches `docs.triggers.milestone_globs`
+8. `milestone` if a file was added or deleted under `docs.triggers.source_roots`
+9. `milestone` if there are both source-root and test-root changes and at least one pending turn
+10. `checkpoint` if checkpoint thresholds are met
+11. otherwise `none`
 
-V1 checkpoint classification is intentionally simple.
+Checkpoint thresholds are:
 
-The system should checkpoint when any of these are true:
+- pending turns reached `checkpoint_turn_threshold`
+- changed files reached `checkpoint_file_threshold`
+- enough time passed since `last_checkpoint_at`
 
-1. `pending_turn_count + 1 >= checkpoint_turn_threshold`
-2. `changed_file_count >= checkpoint_file_threshold`
-3. `now - last_checkpoint_at >= checkpoint_age_minutes`
+## 12. Stop Hook Algorithm
 
-Implementation shape:
+```mermaid
+sequenceDiagram
+    participant Hook as "Stop Hook"
+    participant State as "Manager State"
+    participant Git as "Git Repo"
+    participant Docs as "codex exec"
 
-```rust
-fn should_checkpoint(delta: &Delta, manager: &ManagerState, config: &CommitConfig) -> bool {
-    if delta.changed_paths.is_empty() {
-        return false;
-    }
-    if manager.pending_turn_count + 1 >= config.checkpoint_turn_threshold {
-        return true;
-    }
-    if delta.changed_paths.len() as u32 >= config.checkpoint_file_threshold {
-        return true;
-    }
-    let Some(last_checkpoint_at) = manager.last_checkpoint_at else {
-        return false;
-    };
-    now_unix_seconds().saturating_sub(last_checkpoint_at)
-        >= config.checkpoint_age_minutes.saturating_mul(60)
-}
+    Hook->>Git: Resolve repo root
+    Hook->>State: Load turn state
+    Hook->>Git: Build current snapshot from owned paths
+    Hook->>Hook: Compare against turn baseline and last checkpoint baseline
+    Hook->>State: Load manager state
+    Hook->>Hook: Classify turn as none/checkpoint/milestone
+
+    alt none
+        Hook->>State: Record pending turn if delta exists
+        Hook->>State: Delete turn state
+    else checkpoint
+        Hook->>Git: Stage owned paths
+        Hook->>Git: Commit checkpoint(...)
+        Hook->>State: Update checkpoint baseline and reset pending turns
+        Hook->>State: Delete turn state
+    else milestone
+        Hook->>Git: Backup managed docs outputs
+        Hook->>Docs: Run codex exec docs worker
+        alt docs success
+            Hook->>Git: Stage owned paths + managed docs outputs
+            Hook->>Git: Commit milestone(...)
+            Hook->>State: Update checkpoint baseline
+            Hook->>State: Update milestone baseline
+            Hook->>State: Clear docs backlog and reset pending turns
+        else docs failure
+            Hook->>Git: Restore managed docs outputs exactly
+            Hook->>State: Persist docs backlog and error
+        end
+        Hook->>State: Delete turn state
+    end
 ```
 
-If no checkpoint is created, the manager records a pending turn:
+## 13. Docs Worker Contract
 
-- increment `pending_turn_count`
-- set `pending_first_seen_at` if empty
-- update `pending_last_seen_at`
+Milestone commits launch a synchronous `codex exec` process.
 
-## 15. Staging and Commit Boundaries
+Pattern:
 
-Sprocket must never commit the whole repo indiscriminately.
-
-The stage rule is:
-
-- stage only configured owned paths
-- commit only staged files that actually changed inside that bounded set
-
-This is what keeps the autosave local, predictable, and safe.
-
-### Stage logic
-
-```rust
-let staged = stage_pathspecs(&repo, &config.commit.owned_paths)?;
-if !staged_changes_exist(&repo, &staged)? {
-    return Ok(());
-}
+```bash
+codex exec --ephemeral --ask-for-approval never --sandbox workspace-write \
+  -m gpt-5.3-codex-spark \
+  -c model_reasoning_effort="medium" \
+  -C <repo> \
+  --disable codex_hooks \
+  "<prompt>"
 ```
 
-### Commit logic
+The prompt is composed from:
 
-The commit path first asks git which staged files actually changed, then commits only those files.
+- built-in Sprocket docs instructions, unless `docs.instructions` overrides them
+- `/.sprocket/rules/project.md`
+- `/.sprocket/rules/architecture.md`
+- the configured managed output list
+- a JSON summary of the current manifest delta
 
-That prevents a repo-wide commit from accidentally picking up unrelated staged state.
+Worker rules:
 
-## 16. Commit Message Policy
+- may edit only `docs.managed_outputs`
+- may recreate missing docs when `docs.recreate_missing = true`
+- must no-op cleanly when docs are already current
+- must not touch code, tests, `/.sprocket/state/`, or `/.codex/hooks.json`
 
-V1 uses a templated local commit message:
+## 14. Commit Messages
 
-```text
-checkpoint({area}): save current work [auto]
-```
+Current commit messages are area-stable and use the config-driven default area:
 
-And substitutes:
+- `checkpoint(core): save current work [auto]`
+- `milestone(core): sync docs and save current work [auto]`
 
-- `{area}` with `default_area`
+The area is still config-driven in this milestone; there is no dynamic area inference yet.
 
-In the first milestone the area is config-driven and defaults to `core`.
+## 15. Locking
 
-This is intentionally minimal because profile-specific area inference does not exist yet.
-
-## 17. Repo Locking
-
-The system must serialize competing checkpoint attempts within one repo.
-
-Lock path:
+The system serializes competing `Stop` hooks with a repo-local lock:
 
 ```text
 /.sprocket/state/checkpoint/lock
 ```
 
-Lock behavior:
+Behavior:
 
-- create with `create_new(true)` so acquisition is atomic
-- if a live lock exists, no-op instead of blocking
-- if the lock is stale beyond `lock_timeout_seconds`, delete and replace it
+- create with `O_CREAT | O_EXCL`
+- if an existing lock is older than `lock_timeout_seconds`, delete and replace it
+- hold the lock for the full `Stop`-hook run
+- release it on drop
 
-### Lock lifecycle
+That means both checkpoint commits and docs-bearing milestone commits are single-writer operations inside one repo.
 
-```mermaid
-flowchart TD
-    A["Checkpoint hook starts"] --> B["Try to create /.sprocket/state/checkpoint/lock"]
-    B -->|success| C["Hold lock for rest of checkpoint evaluation"]
-    B -->|already exists| D["Check lock age"]
-    D -->|fresh| E["Return no-op"]
-    D -->|stale| F["Delete stale lock and retry create"]
-    F --> C
-    C --> G["Stage + maybe commit + update state"]
-    G --> H["Drop lock file"]
-```
+## 16. Failure Model
 
-This is not a distributed lock. It is a repo-local lock for concurrent Codex sessions on one machine or shared filesystem context.
+Important failure rules:
 
-## 18. Direct Git Mutation Guard
+- if no turn state exists, the `Stop` hook exits quietly
+- if the live lock is held, the `Stop` hook exits quietly
+- if docs worker fails or times out, no milestone commit is created
+- docs failure restores managed docs outputs exactly to their pre-run bytes
+- docs failure leaves code changes uncommitted and sets `docs_backlog = true`
+- backlog forces the next eligible `Stop` back through milestone docs sync
 
-Codex is allowed to edit files, but it is not allowed to own commits.
+## 17. Reconstruction Checklist
 
-The pre-tool-use hook parses the `Bash` command text and denies mutating git commands such as:
+To recreate this system from scratch:
 
-- `git add`
-- `git commit`
-- `git merge`
-- `git rebase`
-- `git cherry-pick`
-- `git push`
-- `git tag`
-- `git stash`
-- `git am`
-- `git reset --hard`
-
-Allowed example:
-
-- `git status --short`
-
-Denied response shape:
-
-```json
-{
-  "hookSpecificOutput": {
-    "hookEventName": "PreToolUse",
-    "permissionDecision": "deny",
-    "permissionDecisionReason": "Commits are owned by Sprocket. Make code changes only."
-  }
-}
-```
-
-This keeps the commit path centralized inside Sprocket rather than split across ad hoc git calls.
-
-## 19. Failure Semantics
-
-The v1 hook path is intentionally soft-fail.
-
-If the hook cannot proceed, the correct behavior is usually:
-
-- no-op
-- do not corrupt repo state
-- do not create a partial commit
-
-Examples:
-
-- no turn state found -> return
-- live lock held by another checkpoint -> return
-- no staged owned changes -> return
-- unchanged snapshot -> return
-
-This keeps the commit system conservative.
-
-## 20. Reimplementation Checklist
-
-If you were rebuilding this system in another codebase or language, you must reproduce these invariants:
-
-1. `/.sprocket/` is canonical; `/.codex/` is adapter-only.
-2. Hook installation merges safely and removes only Sprocket-managed groups.
-3. `UserPromptSubmit` captures a baseline snapshot for the current turn.
-4. First baseline initializes manager checkpoint state when empty.
-5. `Stop` compares current snapshot against:
-   - turn baseline
-   - last checkpoint baseline
-6. Only owned paths affect snapshots and commits.
-7. Checkpoint classification is threshold-based and repo-local.
-8. State lives under `/.sprocket/state/`.
-9. A repo-local lock serializes checkpoint attempts.
-10. Direct git mutation commands from the agent are denied.
-
-If any one of those is missing, the recreated system is not functionally equivalent.
-
-## 21. Minimal Reconstruction Pseudocode
-
-```text
-install codex:
-  resolve repo root
-  resolve current binary path
-  ensure /.sprocket/state/checkpoint/turns
-  write or merge /.sprocket/sprocket.toml
-  add .sprocket/state/ to .gitignore
-  merge /.codex/hooks.json with three generated hook groups
-
-baseline hook:
-  load payload
-  resolve repo root
-  load config
-  snapshot owned paths
-  if manager baseline missing:
-    initialize manager baseline from current snapshot and current HEAD
-  save turn state keyed by turn id
-
-pre-tool-use hook:
-  parse command text from payload
-  if command is a mutating git command:
-    emit Codex deny JSON
-
-checkpoint hook:
-  load payload
-  resolve repo root
-  load config
-  resolve turn state
-  snapshot owned paths
-  if snapshot == turn baseline: return
-  acquire repo-local lock or return
-  load manager state
-  if snapshot == last checkpoint baseline: return
-  diff manager manifest vs current manifest
-  if delta empty: return
-  if checkpoint thresholds not met:
-    record pending turn and return
-  stage owned paths
-  if no staged changes: return
-  commit staged changed files only
-  update manager state
-  delete turn state
-```
-
-## 22. Current Limitations
-
-This file documents the current v1 commit-core system, not the intended future system.
-
-Known intentional omissions:
-
-- no docs worker
-- no startup adoption
-- no session registry
-- no stale-session warnings
-- no milestone class
-- no profile-aware area inference
-
-Those belong to later milestones.
+1. Install repo-local config under `/.sprocket/` and Codex hook wiring under `/.codex/`.
+2. Capture a turn baseline on `UserPromptSubmit`.
+3. Keep meaningful snapshots limited to `commit.owned_paths`.
+4. Persist manager and turn state under `/.sprocket/state/checkpoint/`.
+5. Classify `Stop` work into `none`, `checkpoint`, or `milestone`.
+6. Run `codex exec` only for milestones and only before the commit.
+7. Back up and restore managed docs around docs-worker failure.
+8. Stage only owned code paths plus managed docs outputs when docs ran successfully.
+9. Block direct git mutations through the `PreToolUse` hook.
+10. Use a repo-local lock for the full `Stop`-hook path.

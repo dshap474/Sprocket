@@ -1,4 +1,8 @@
-use std::collections::{BTreeMap, HashSet};
+mod classification;
+mod config;
+mod docs_worker;
+
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read};
@@ -8,13 +12,13 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
+use classification::{classify_kind, diff_manifests};
+use config::{CommitKind, load_config, render_commit_message, write_or_update_config};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const SPROCKET_HOOK_MARKER: &str = "--sprocket-managed";
-const DEFAULT_CHECKPOINT_MESSAGE: &str = "checkpoint({area}): save current work [auto]";
-const DEFAULT_AREA: &str = "core";
 
 pub fn run<I>(args: I) -> Result<()>
 where
@@ -124,6 +128,7 @@ fn install_codex_backend(repo: &Path) -> Result<()> {
     ensure_sprocket_dirs(repo)?;
     write_or_update_config(repo, &binary_path)?;
     ensure_gitignore_rule(repo, ".sprocket/state/")?;
+    docs_worker::install_managed_rules(repo)?;
     merge_codex_hooks(repo, &binary_path)?;
     Ok(())
 }
@@ -206,94 +211,70 @@ fn run_codex_checkpoint(payload: &Value) -> Result<()> {
         &manager.last_checkpoint_manifest,
         &current_snapshot.manifest,
     );
-    if delta.changed_paths.is_empty() {
+    let kind = classify_kind(&delta, &manager, &config)?;
+    if kind == CommitKind::None {
+        if !delta.changed_paths.is_empty() {
+            record_pending_turn(&mut manager);
+            save_manager_state(&repo, &manager)?;
+        }
         cleanup_turn_state(&turn_path)?;
         return Ok(());
     }
 
-    if !should_checkpoint(&delta, &manager, &config.commit) {
-        record_pending_turn(&mut manager);
-        save_manager_state(&repo, &manager)?;
-        cleanup_turn_state(&turn_path)?;
-        return Ok(());
+    let docs_ran = kind == CommitKind::Milestone && config.docs.enabled;
+    if docs_ran {
+        let backups = docs_worker::backup_docs_outputs(&repo, &config.docs.managed_outputs)?;
+        manager.last_docs_attempt_at = Some(now_unix_seconds());
+        let (docs_ok, docs_message) = docs_worker::run_docs_worker(&repo, &delta, &config)?;
+        if docs_ok {
+            manager.docs_backlog = false;
+            manager.last_docs_error = None;
+        } else {
+            docs_worker::restore_docs_outputs(&repo, &backups)?;
+            manager.docs_backlog = true;
+            manager.last_docs_error = Some(docs_message);
+            save_manager_state(&repo, &manager)?;
+            cleanup_turn_state(&turn_path)?;
+            return Ok(());
+        }
     }
 
-    let staged = stage_pathspecs(&repo, &config.commit.owned_paths)?;
+    let mut staged = stage_pathspecs(&repo, &config.commit.owned_paths)?;
+    if docs_ran {
+        staged.extend(stage_pathspecs(&repo, &config.docs.managed_outputs)?);
+        staged.sort();
+        staged.dedup();
+    }
     if !staged_changes_exist(&repo, &staged)? {
         cleanup_turn_state(&turn_path)?;
         return Ok(());
     }
 
-    let message = render_commit_message(&config.commit);
+    let message = render_commit_message(&config.commit, kind);
     let Some(head) = commit_pathspecs(&repo, &message, &staged)? else {
         cleanup_turn_state(&turn_path)?;
         return Ok(());
     };
 
-    manager.last_checkpoint_fingerprint = Some(current_snapshot.fingerprint);
-    manager.last_checkpoint_manifest = current_snapshot.manifest;
+    manager.last_checkpoint_fingerprint = Some(current_snapshot.fingerprint.clone());
+    manager.last_checkpoint_manifest = current_snapshot.manifest.clone();
     manager.last_checkpoint_commit = Some(head);
     manager.last_checkpoint_at = Some(now_unix_seconds());
     manager.pending_turn_count = 0;
     manager.pending_first_seen_at = None;
     manager.pending_last_seen_at = None;
+    if kind == CommitKind::Milestone {
+        manager.last_milestone_fingerprint = Some(current_snapshot.fingerprint.clone());
+        manager.last_milestone_manifest = current_snapshot.manifest.clone();
+    }
     manager.generation += 1;
     save_manager_state(&repo, &manager)?;
     cleanup_turn_state(&turn_path)?;
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SprocketConfig {
-    version: u32,
-    backend: BackendConfig,
-    commit: CommitConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BackendConfig {
-    codex: CodexBackendConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CodexBackendConfig {
-    binary_path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CommitConfig {
-    owned_paths: Vec<String>,
-    checkpoint_turn_threshold: u32,
-    checkpoint_file_threshold: u32,
-    checkpoint_age_minutes: u64,
-    lock_timeout_seconds: u64,
-    default_area: String,
-    message_template: String,
-}
-
-impl Default for SprocketConfig {
-    fn default() -> Self {
-        Self {
-            version: 1,
-            backend: BackendConfig {
-                codex: CodexBackendConfig {
-                    binary_path: String::new(),
-                },
-            },
-            commit: CommitConfig {
-                owned_paths: vec!["src".into(), "tests".into()],
-                checkpoint_turn_threshold: 2,
-                checkpoint_file_threshold: 3,
-                checkpoint_age_minutes: 20,
-                lock_timeout_seconds: 300,
-                default_area: DEFAULT_AREA.into(),
-                message_template: DEFAULT_CHECKPOINT_MESSAGE.into(),
-            },
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 struct ManagerState {
     version: u32,
     generation: u64,
@@ -301,9 +282,14 @@ struct ManagerState {
     last_checkpoint_manifest: Vec<ManifestEntry>,
     last_checkpoint_commit: Option<String>,
     last_checkpoint_at: Option<u64>,
+    last_milestone_fingerprint: Option<String>,
+    last_milestone_manifest: Vec<ManifestEntry>,
     pending_turn_count: u32,
     pending_first_seen_at: Option<u64>,
     pending_last_seen_at: Option<u64>,
+    docs_backlog: bool,
+    last_docs_attempt_at: Option<u64>,
+    last_docs_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -327,45 +313,6 @@ struct ManifestEntry {
 struct Snapshot {
     manifest: Vec<ManifestEntry>,
     fingerprint: String,
-}
-
-#[derive(Debug, Clone, Default)]
-struct Delta {
-    added: Vec<String>,
-    modified: Vec<String>,
-    deleted: Vec<String>,
-    changed_paths: Vec<String>,
-}
-
-fn write_or_update_config(repo: &Path, binary_path: &Path) -> Result<()> {
-    let path = repo.join(".sprocket/sprocket.toml");
-    let mut config = if path.exists() {
-        load_config(repo)?
-    } else {
-        SprocketConfig::default()
-    };
-    config.backend.codex.binary_path = binary_path.display().to_string();
-    let content = toml::to_string_pretty(&config)?;
-    write_text(&path, &(content + "\n"))?;
-    Ok(())
-}
-
-fn load_config(repo: &Path) -> Result<SprocketConfig> {
-    let path = repo.join(".sprocket/sprocket.toml");
-    let content = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read config at {}", path.display()))?;
-    let mut config: SprocketConfig = toml::from_str(&content)
-        .with_context(|| format!("failed to parse config at {}", path.display()))?;
-    if config.commit.owned_paths.is_empty() {
-        config.commit.owned_paths = SprocketConfig::default().commit.owned_paths;
-    }
-    if config.commit.default_area.is_empty() {
-        config.commit.default_area = DEFAULT_AREA.into();
-    }
-    if config.commit.message_template.is_empty() {
-        config.commit.message_template = DEFAULT_CHECKPOINT_MESSAGE.into();
-    }
-    Ok(config)
 }
 
 fn merge_codex_hooks(repo: &Path, binary_path: &Path) -> Result<()> {
@@ -542,77 +489,6 @@ fn build_git_args<'a>(
     args
 }
 
-fn diff_manifests(old_manifest: &[ManifestEntry], new_manifest: &[ManifestEntry]) -> Delta {
-    let old_map: BTreeMap<_, _> = old_manifest
-        .iter()
-        .map(|entry| (&entry.path, entry))
-        .collect();
-    let new_map: BTreeMap<_, _> = new_manifest
-        .iter()
-        .map(|entry| (&entry.path, entry))
-        .collect();
-    let mut delta = Delta::default();
-
-    let all_paths: HashSet<&String> = old_map.keys().chain(new_map.keys()).copied().collect();
-    let mut sorted_paths: Vec<&String> = all_paths.into_iter().collect();
-    sorted_paths.sort();
-
-    for path in sorted_paths {
-        match (old_map.get(path), new_map.get(path)) {
-            (None, Some(new_entry)) => {
-                if new_entry.status == "deleted" {
-                    delta.deleted.push(path.clone());
-                } else {
-                    delta.added.push(path.clone());
-                }
-            }
-            (Some(old_entry), None) => {
-                if old_entry.status != "deleted" {
-                    delta.deleted.push(path.clone());
-                }
-            }
-            (Some(old_entry), Some(new_entry)) if old_entry != new_entry => {
-                if old_entry.status != "deleted" && new_entry.status == "deleted" {
-                    delta.deleted.push(path.clone());
-                } else if old_entry.status == "deleted" && new_entry.status != "deleted" {
-                    delta.added.push(path.clone());
-                } else {
-                    delta.modified.push(path.clone());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    delta.changed_paths = delta
-        .added
-        .iter()
-        .chain(&delta.modified)
-        .chain(&delta.deleted)
-        .cloned()
-        .collect();
-    delta.changed_paths.sort();
-    delta.changed_paths.dedup();
-    delta
-}
-
-fn should_checkpoint(delta: &Delta, manager: &ManagerState, config: &CommitConfig) -> bool {
-    if delta.changed_paths.is_empty() {
-        return false;
-    }
-    if manager.pending_turn_count + 1 >= config.checkpoint_turn_threshold {
-        return true;
-    }
-    if delta.changed_paths.len() as u32 >= config.checkpoint_file_threshold {
-        return true;
-    }
-    let Some(last_checkpoint_at) = manager.last_checkpoint_at else {
-        return false;
-    };
-    now_unix_seconds().saturating_sub(last_checkpoint_at)
-        >= config.checkpoint_age_minutes.saturating_mul(60)
-}
-
 fn record_pending_turn(manager: &mut ManagerState) {
     let now = now_unix_seconds();
     if manager.pending_first_seen_at.is_none() {
@@ -620,12 +496,6 @@ fn record_pending_turn(manager: &mut ManagerState) {
     }
     manager.pending_last_seen_at = Some(now);
     manager.pending_turn_count += 1;
-}
-
-fn render_commit_message(config: &CommitConfig) -> String {
-    config
-        .message_template
-        .replace("{area}", &config.default_area)
 }
 
 fn stage_pathspecs(repo: &Path, pathspecs: &[String]) -> Result<Vec<String>> {
@@ -1204,6 +1074,8 @@ mod tests {
         assert!(hooks_object.contains_key("Stop"));
         assert!(repo.join(".sprocket/sprocket.toml").exists());
         assert!(repo.join(".sprocket/state/checkpoint/turns").is_dir());
+        assert!(repo.join(".sprocket/rules/project.md").exists());
+        assert!(repo.join(".sprocket/rules/architecture.md").exists());
     }
 
     #[test]
@@ -1273,6 +1145,326 @@ mod tests {
             .unwrap()
             .stdout;
         assert_eq!(subject.trim(), "checkpoint(core): save current work [auto]");
+    }
+
+    fn write_fake_codex(repo: &Path, body: &str) -> PathBuf {
+        let path = repo.join("fake-codex.sh");
+        write(&path, &format!("#!/bin/sh\nset -eu\n{body}\n"));
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+        }
+        fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    fn with_fake_codex<F>(repo: &Path, body: &str, f: F)
+    where
+        F: FnOnce(),
+    {
+        use std::sync::{Mutex, OnceLock};
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let fake = write_fake_codex(repo, body);
+        let previous = std::env::var_os("SPROCKET_CODEX_BIN");
+        unsafe {
+            std::env::set_var("SPROCKET_CODEX_BIN", &fake);
+        }
+        f();
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var("SPROCKET_CODEX_BIN", value);
+            },
+            None => unsafe {
+                std::env::remove_var("SPROCKET_CODEX_BIN");
+            },
+        }
+    }
+
+    #[test]
+    fn checkpoint_change_does_not_invoke_docs_worker() {
+        let (_temp, repo) = init_repo();
+        install_codex_backend(&repo).unwrap();
+        let mut config = load_config(&repo).unwrap();
+        config.commit.checkpoint_turn_threshold = 1;
+        config.commit.checkpoint_file_threshold = 1;
+        config.commit.checkpoint_age_minutes = 0;
+        config.commit.milestone_file_threshold = 99;
+        write_text(
+            &repo.join(".sprocket/sprocket.toml"),
+            &(toml::to_string_pretty(&config).unwrap() + "\n"),
+        )
+        .unwrap();
+
+        with_fake_codex(
+            &repo,
+            "echo invoked > \"$PWD/docs-worker-ran\"\nexit 0",
+            || {
+                run_codex_baseline(&payload(&repo, &[("turnId", "turn-1")])).unwrap();
+                write(&repo.join("src/main.py"), "print('updated')\n");
+                run_codex_checkpoint(&payload(&repo, &[("turnId", "turn-1")])).unwrap();
+            },
+        );
+
+        assert!(!repo.join("docs-worker-ran").exists());
+        let subject = git_command(&repo, ["log", "-1", "--format=%s"])
+            .unwrap()
+            .stdout;
+        assert_eq!(subject.trim(), "checkpoint(core): save current work [auto]");
+    }
+
+    #[test]
+    fn milestone_change_runs_docs_worker_and_commits_docs() {
+        let (_temp, repo) = init_repo();
+        install_codex_backend(&repo).unwrap();
+        let mut config = load_config(&repo).unwrap();
+        config.commit.checkpoint_turn_threshold = 99;
+        config.commit.checkpoint_file_threshold = 99;
+        config.commit.milestone_file_threshold = 1;
+        write_text(
+            &repo.join(".sprocket/sprocket.toml"),
+            &(toml::to_string_pretty(&config).unwrap() + "\n"),
+        )
+        .unwrap();
+
+        with_fake_codex(
+            &repo,
+            "mkdir -p \"$PWD/docs/project/llms\"\nprintf '# Architecture\\n' > \"$PWD/docs/ARCHITECTURE.md\"\nprintf 'index\\n' > \"$PWD/docs/project/llms/llms.txt\"\n",
+            || {
+                run_codex_baseline(&payload(&repo, &[("turnId", "turn-1")])).unwrap();
+                write(&repo.join("src/main.py"), "print('updated')\n");
+                run_codex_checkpoint(&payload(&repo, &[("turnId", "turn-1")])).unwrap();
+            },
+        );
+
+        let subject = git_command(&repo, ["log", "-1", "--format=%s"])
+            .unwrap()
+            .stdout;
+        assert_eq!(
+            subject.trim(),
+            "milestone(core): sync docs and save current work [auto]"
+        );
+        assert!(repo.join("docs/ARCHITECTURE.md").exists());
+        assert!(repo.join("docs/project/llms/llms.txt").exists());
+    }
+
+    #[test]
+    fn milestone_commit_can_land_when_docs_worker_is_noop() {
+        let (_temp, repo) = init_repo();
+        install_codex_backend(&repo).unwrap();
+        let mut config = load_config(&repo).unwrap();
+        config.commit.checkpoint_turn_threshold = 99;
+        config.commit.checkpoint_file_threshold = 99;
+        config.commit.milestone_file_threshold = 1;
+        write_text(
+            &repo.join(".sprocket/sprocket.toml"),
+            &(toml::to_string_pretty(&config).unwrap() + "\n"),
+        )
+        .unwrap();
+        write(&repo.join("docs/ARCHITECTURE.md"), "# Architecture\n");
+        write(&repo.join("docs/project/llms/llms.txt"), "index\n");
+
+        with_fake_codex(&repo, "exit 0", || {
+            run_codex_baseline(&payload(&repo, &[("turnId", "turn-1")])).unwrap();
+            write(&repo.join("src/main.py"), "print('updated')\n");
+            run_codex_checkpoint(&payload(&repo, &[("turnId", "turn-1")])).unwrap();
+        });
+
+        let subject = git_command(&repo, ["log", "-1", "--format=%s"])
+            .unwrap()
+            .stdout;
+        assert_eq!(
+            subject.trim(),
+            "milestone(core): sync docs and save current work [auto]"
+        );
+    }
+
+    #[test]
+    fn docs_failure_restores_outputs_and_blocks_commit() {
+        let (_temp, repo) = init_repo();
+        install_codex_backend(&repo).unwrap();
+        let mut config = load_config(&repo).unwrap();
+        config.commit.checkpoint_turn_threshold = 99;
+        config.commit.checkpoint_file_threshold = 99;
+        config.commit.milestone_file_threshold = 1;
+        write_text(
+            &repo.join(".sprocket/sprocket.toml"),
+            &(toml::to_string_pretty(&config).unwrap() + "\n"),
+        )
+        .unwrap();
+        write(&repo.join("docs/ARCHITECTURE.md"), "before\n");
+        write(&repo.join("docs/project/llms/llms.txt"), "before\n");
+
+        with_fake_codex(
+            &repo,
+            "printf 'after\\n' > \"$PWD/docs/ARCHITECTURE.md\"\nprintf 'boom\\n' >&2\nexit 1",
+            || {
+                run_codex_baseline(&payload(&repo, &[("turnId", "turn-1")])).unwrap();
+                write(&repo.join("src/main.py"), "print('updated')\n");
+                run_codex_checkpoint(&payload(&repo, &[("turnId", "turn-1")])).unwrap();
+            },
+        );
+
+        assert_eq!(
+            fs::read_to_string(repo.join("docs/ARCHITECTURE.md")).unwrap(),
+            "before\n"
+        );
+        let manager = load_manager_state(&repo).unwrap();
+        assert!(manager.docs_backlog);
+        assert_eq!(manager.last_docs_error.as_deref(), Some("boom"));
+        let subject = git_command(&repo, ["log", "-1", "--format=%s"])
+            .unwrap()
+            .stdout;
+        assert_eq!(subject.trim(), "base");
+    }
+
+    #[test]
+    fn backlog_retries_next_turn_and_clears_after_success() {
+        let (_temp, repo) = init_repo();
+        install_codex_backend(&repo).unwrap();
+        let mut config = load_config(&repo).unwrap();
+        config.commit.checkpoint_turn_threshold = 1;
+        config.commit.checkpoint_file_threshold = 1;
+        config.commit.checkpoint_age_minutes = 0;
+        config.commit.milestone_file_threshold = 1;
+        write_text(
+            &repo.join(".sprocket/sprocket.toml"),
+            &(toml::to_string_pretty(&config).unwrap() + "\n"),
+        )
+        .unwrap();
+
+        with_fake_codex(&repo, "printf 'fail\\n' >&2\nexit 1", || {
+            run_codex_baseline(&payload(&repo, &[("turnId", "turn-1")])).unwrap();
+            write(&repo.join("src/main.py"), "print('updated once')\n");
+            run_codex_checkpoint(&payload(&repo, &[("turnId", "turn-1")])).unwrap();
+        });
+        assert!(load_manager_state(&repo).unwrap().docs_backlog);
+
+        with_fake_codex(
+            &repo,
+            "mkdir -p \"$PWD/docs/project/llms\"\nprintf '# Architecture\\n' > \"$PWD/docs/ARCHITECTURE.md\"\nprintf 'index\\n' > \"$PWD/docs/project/llms/llms.txt\"\n",
+            || {
+                run_codex_baseline(&payload(&repo, &[("turnId", "turn-2")])).unwrap();
+                write(&repo.join("src/other.py"), "print('next')\n");
+                run_codex_checkpoint(&payload(&repo, &[("turnId", "turn-2")])).unwrap();
+            },
+        );
+
+        let manager = load_manager_state(&repo).unwrap();
+        assert!(!manager.docs_backlog);
+        assert!(manager.last_docs_error.is_none());
+        let subject = git_command(&repo, ["log", "-1", "--format=%s"])
+            .unwrap()
+            .stdout;
+        assert_eq!(
+            subject.trim(),
+            "milestone(core): sync docs and save current work [auto]"
+        );
+    }
+
+    #[test]
+    fn docs_outputs_do_not_self_trigger_commits() {
+        let (_temp, repo) = init_repo();
+        install_codex_backend(&repo).unwrap();
+        set_fast_policy(&repo);
+        write(&repo.join("docs/ARCHITECTURE.md"), "# Architecture\n");
+
+        let before = current_head(&repo).unwrap().unwrap();
+        run_codex_baseline(&payload(&repo, &[("turnId", "turn-1")])).unwrap();
+        write(&repo.join("docs/ARCHITECTURE.md"), "# Changed\n");
+        run_codex_checkpoint(&payload(&repo, &[("turnId", "turn-1")])).unwrap();
+        let after = current_head(&repo).unwrap().unwrap();
+
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn docs_config_overrides_are_honored() {
+        let (_temp, repo) = init_repo();
+        install_codex_backend(&repo).unwrap();
+        let mut config = load_config(&repo).unwrap();
+        config.commit.checkpoint_turn_threshold = 99;
+        config.commit.checkpoint_file_threshold = 99;
+        config.commit.milestone_file_threshold = 99;
+        config.docs.managed_outputs = vec!["docs/custom/guide.md".into()];
+        config.docs.model = "gpt-test-model".into();
+        config.docs.reasoning_effort = "high".into();
+        config.docs.triggers.milestone_globs = vec!["src/**".into()];
+        write_text(
+            &repo.join(".sprocket/sprocket.toml"),
+            &(toml::to_string_pretty(&config).unwrap() + "\n"),
+        )
+        .unwrap();
+
+        with_fake_codex(
+            &repo,
+            "printf '%s\\n' \"$@\" > \"$PWD/codex-args.txt\"\nmkdir -p \"$PWD/docs/custom\"\nprintf 'guide\\n' > \"$PWD/docs/custom/guide.md\"\n",
+            || {
+                run_codex_baseline(&payload(&repo, &[("turnId", "turn-1")])).unwrap();
+                write(&repo.join("src/main.py"), "print('docs override')\n");
+                run_codex_checkpoint(&payload(&repo, &[("turnId", "turn-1")])).unwrap();
+            },
+        );
+
+        let args = fs::read_to_string(repo.join("codex-args.txt")).unwrap();
+        assert!(args.contains("gpt-test-model"));
+        assert!(args.contains("model_reasoning_effort=\"high\""));
+        assert!(repo.join("docs/custom/guide.md").exists());
+        let subject = git_command(&repo, ["log", "-1", "--format=%s"])
+            .unwrap()
+            .stdout;
+        assert_eq!(
+            subject.trim(),
+            "milestone(core): sync docs and save current work [auto]"
+        );
+    }
+
+    #[test]
+    fn config_validation_rejects_docs_overlap() {
+        let (_temp, repo) = init_repo();
+        install_codex_backend(&repo).unwrap();
+        let mut config = load_config(&repo).unwrap();
+        config.commit.owned_paths.push("docs".into());
+        write_text(
+            &repo.join(".sprocket/sprocket.toml"),
+            &(toml::to_string_pretty(&config).unwrap() + "\n"),
+        )
+        .unwrap();
+
+        let error = load_config(&repo).unwrap_err().to_string();
+        assert!(error.contains("docs.managed_outputs overlaps commit.owned_paths"));
+    }
+
+    #[test]
+    fn live_lock_prevents_docs_bearing_milestone_attempt() {
+        let (_temp, repo) = init_repo();
+        install_codex_backend(&repo).unwrap();
+        let mut config = load_config(&repo).unwrap();
+        config.commit.milestone_file_threshold = 1;
+        write_text(
+            &repo.join(".sprocket/sprocket.toml"),
+            &(toml::to_string_pretty(&config).unwrap() + "\n"),
+        )
+        .unwrap();
+
+        with_fake_codex(
+            &repo,
+            "mkdir -p \"$PWD/docs/project/llms\"\nprintf '# Architecture\\n' > \"$PWD/docs/ARCHITECTURE.md\"\nprintf 'index\\n' > \"$PWD/docs/project/llms/llms.txt\"\n",
+            || {
+                run_codex_baseline(&payload(&repo, &[("turnId", "turn-1")])).unwrap();
+                write(&repo.join("src/main.py"), "print('updated')\n");
+                let guard = acquire_lock(&repo, 300).unwrap().unwrap();
+                run_codex_checkpoint(&payload(&repo, &[("turnId", "turn-1")])).unwrap();
+                drop(guard);
+            },
+        );
+
+        let subject = git_command(&repo, ["log", "-1", "--format=%s"])
+            .unwrap()
+            .stdout;
+        assert_eq!(subject.trim(), "base");
     }
 
     #[test]
