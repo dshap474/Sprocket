@@ -31,4 +31,16 @@ pub enum JournalEvent {
         stream_id: String,
         reason: String,
     },
+    HookNoop {
+        ts: i64,
+        stream_id: String,
+        hook: String,
+        reason: String,
+    },
+    HookError {
+        ts: i64,
+        stream_id: String,
+        hook: String,
+        reason: String,
+    },
 }

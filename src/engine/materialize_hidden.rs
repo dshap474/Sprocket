@@ -23,10 +23,7 @@ pub fn materialize_hidden_checkpoint(
     }
 
     let head_owned = if let Some(head) = head_oid {
-        git.list_head_owned_paths(head, &policy.git_include_pathspecs())?
-            .into_iter()
-            .filter(|path| policy.is_owned_path(path))
-            .collect()
+        git.list_head_owned_paths(head, &policy.git_owned_pathspecs())?
     } else {
         Vec::new()
     };

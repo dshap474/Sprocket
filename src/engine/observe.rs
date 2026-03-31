@@ -15,10 +15,7 @@ pub fn capture_strict_snapshot(
     policy: &Policy,
 ) -> Result<StrictSnapshot> {
     let mut entries = Vec::new();
-    for path in git.list_present_paths(&policy.git_include_pathspecs())? {
-        if !policy.is_owned_path(&path) {
-            continue;
-        }
+    for path in git.list_present_paths(&policy.git_owned_pathspecs())? {
         let abs = path.join_to(repo_root);
         let meta = fs::symlink_metadata(&abs)?;
 

@@ -117,6 +117,41 @@ impl GitCli {
             .collect()
     }
 
+    fn tracked_paths_from_tree(
+        &self,
+        treeish: &str,
+        pathspecs: &[String],
+    ) -> Result<Vec<RepoPath>> {
+        let mut args: Vec<OsString> = vec![
+            OsString::from("archive"),
+            OsString::from("--format=tar"),
+            OsString::from(treeish),
+            OsString::from("--"),
+        ];
+        args.extend(pathspecs.iter().map(OsString::from));
+        let out = self.run(args)?;
+        Ok(parse_tar_paths(&out.stdout))
+    }
+
+    fn status_paths(&self, pathspecs: &[String]) -> Result<Vec<RepoPath>> {
+        let mut args: Vec<OsString> = vec![
+            OsString::from("status"),
+            OsString::from("--porcelain=v1"),
+            OsString::from("-z"),
+            OsString::from("--untracked-files=all"),
+            OsString::from("--no-renames"),
+            OsString::from("--"),
+        ];
+        args.extend(pathspecs.iter().map(OsString::from));
+        let out = self.run(args)?;
+        Ok(out
+            .stdout
+            .split_str(b"\0")
+            .filter(|entry| entry.len() > 3)
+            .map(|entry| RepoPath::from_bytes(entry[3..].to_vec()))
+            .collect())
+    }
+
     fn hooks_dir(&self) -> Result<PathBuf> {
         let configured = self.run_may_fail(["config", "--path", "core.hooksPath"])?;
         if configured.status.success() {
@@ -191,18 +226,15 @@ impl GitBackend for GitCli {
     }
 
     fn list_present_paths(&self, pathspecs: &[String]) -> Result<Vec<RepoPath>> {
-        let mut args: Vec<OsString> = vec![
-            OsString::from("ls-files"),
-            OsString::from("-z"),
-            OsString::from("--cached"),
-            OsString::from("--others"),
-            OsString::from("--exclude-standard"),
-            OsString::from("--"),
-        ];
-        args.extend(pathspecs.iter().map(OsString::from));
-        let out = self.run(args)?;
         let mut seen = BTreeSet::new();
-        for path in self.path_list_from_output(&out.stdout) {
+        if let Some(head_oid) = self.head_state()?.oid {
+            for path in self.tracked_paths_from_tree(&head_oid, pathspecs)? {
+                if self.path_exists_in_worktree(&path) {
+                    seen.insert(path);
+                }
+            }
+        }
+        for path in self.status_paths(pathspecs)? {
             if self.path_exists_in_worktree(&path) {
                 seen.insert(path);
             }
@@ -211,17 +243,7 @@ impl GitBackend for GitCli {
     }
 
     fn list_head_owned_paths(&self, head_oid: &str, pathspecs: &[String]) -> Result<Vec<RepoPath>> {
-        let mut args: Vec<OsString> = vec![
-            OsString::from("ls-tree"),
-            OsString::from("-r"),
-            OsString::from("-z"),
-            OsString::from("--name-only"),
-            OsString::from(head_oid),
-            OsString::from("--"),
-        ];
-        args.extend(pathspecs.iter().map(OsString::from));
-        let out = self.run(args)?;
-        Ok(self.path_list_from_output(&out.stdout))
+        self.tracked_paths_from_tree(head_oid, pathspecs)
     }
 
     fn hash_object_for_path(&self, path: &RepoPath, bytes: &[u8]) -> Result<String> {
@@ -416,6 +438,50 @@ fn trim_trailing_newline(bytes: &[u8]) -> &[u8] {
         .strip_suffix(b"\n")
         .or_else(|| bytes.strip_suffix(b"\r\n"))
         .unwrap_or(bytes)
+}
+
+fn parse_tar_paths(bytes: &[u8]) -> Vec<RepoPath> {
+    let mut paths = Vec::new();
+    let mut offset = 0usize;
+
+    while offset + 512 <= bytes.len() {
+        let header = &bytes[offset..offset + 512];
+        if header.iter().all(|byte| *byte == 0) {
+            break;
+        }
+
+        let name = tar_field(&header[..100]);
+        let prefix = tar_field(&header[345..500]);
+        let path = if prefix.is_empty() {
+            name.to_vec()
+        } else {
+            [prefix, b"/", name].concat()
+        };
+        let typeflag = header[156];
+        if !path.is_empty() && typeflag != b'5' {
+            paths.push(RepoPath::from_bytes(path));
+        }
+
+        let size = parse_tar_size(&header[124..136]);
+        let blocks = size.div_ceil(512);
+        offset += 512 + (blocks * 512);
+    }
+
+    paths
+}
+
+fn tar_field(bytes: &[u8]) -> &[u8] {
+    bytes.split(|byte| *byte == 0).next().unwrap_or(&[])
+}
+
+fn parse_tar_size(bytes: &[u8]) -> usize {
+    let trimmed = bytes
+        .iter()
+        .copied()
+        .take_while(|byte| *byte != 0)
+        .collect::<Vec<_>>();
+    let text = String::from_utf8_lossy(&trimmed);
+    usize::from_str_radix(text.trim(), 8).unwrap_or(0)
 }
 
 fn path_from_stdout(bytes: &[u8]) -> Result<PathBuf> {
