@@ -1,3 +1,5 @@
+![Sprocket](assets/horizontal.png)
+
 # Sprocket
 
 Sprocket is a Rust CLI that installs a Codex adapter and maintains hidden Git checkpoints for Codex-driven repositories.
