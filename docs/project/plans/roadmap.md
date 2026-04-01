@@ -1,30 +1,45 @@
-# Early Roadmap
+# Roadmap
 
-## Phase 1
+## Current Status
 
-- establish crate structure
-- define CLI command model
-- implement repo discovery
-- implement Codex backend generation
-- implement Python profile generation
+Sprocket now has a working hidden-checkpoint core for a narrow, safety-first envelope:
 
-## Phase 2
+- Codex hook integration
+- attached-branch streams only
+- hidden-only checkpointing
+- hidden ref tip as committed authority
+- append-only intent log for in-flight recovery
+- rebuildable manager and manifest caches
+- hermetic integration coverage, including crash/restart recovery paths
 
-- add migration support from the current skill-driven setup
-- add validation orchestration
-- add managed-surface ownership model
-- add docs repair and milestone refresh logic
+This is the current v1 wedge. It is intentionally narrower than the earlier repo-management and profile-expansion plans.
 
-## Phase 3
+## Phase 1: Trusted Hidden-Only Core
 
-- add Claude Code backend
-- generalize backend interface
-- add TypeScript/React profile
-- add Rust profile
+- finish operator-facing `validate`, `doctor`, and `repair` commands
+- keep the hidden-only contract explicit in docs and CLI behavior
+- harden recovery reporting so users can inspect anchor, intent, and cache state directly
+- keep the current support envelope stable while the core earns trust
 
-## Non-Goals For The First Version
+## Phase 2: Resolve Deferred Algorithm Questions
 
-- broad plugin marketplace
-- too many profiles at once
-- fully generic template engines
-- backend support without a strong maintenance plan
+- decide whether detached `HEAD`, rebase, and sequencer flows stay rejected or get a separate stream model
+- decide whether policy epoching needs more explicit user-facing lifecycle or tooling
+- design manual visible promotion as a separate explicit command, not part of hook-driven checkpointing
+- decide which currently rejected repo features are permanent non-goals versus later support targets
+
+## Phase 3: Controlled Expansion
+
+- add support only after the hidden-only core and repair tooling are trusted
+- candidates for later support:
+  - manual promotion from hidden checkpoints to visible commits
+  - broader repo compatibility after exactness rules are clear
+  - backend expansion beyond Codex
+  - ecosystem/profile expansion only if it does not fork the runtime model
+
+## Near-Term Non-Goals
+
+- automatic visible promotion
+- detached/rewrite workflow support without a separate stream design
+- sparse checkout, gitlinks, and `.gitattributes` support in the current engine
+- broad profile/backend expansion before repair and validation tooling exist

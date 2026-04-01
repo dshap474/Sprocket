@@ -1,1 +1,3 @@
-/target
+/target/
+/docs/dev/
+.DS_Store
