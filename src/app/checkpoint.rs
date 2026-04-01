@@ -19,6 +19,7 @@ use crate::engine::materialize_hidden::{
 use crate::engine::observe::capture_strict_snapshot;
 use crate::engine::repair::snapshot_from_commit;
 use crate::infra::clock::{Clock, SystemClock};
+use crate::infra::failpoint::maybe_fail;
 use crate::infra::git::GitBackend;
 use crate::infra::git_cli::GitCli;
 use crate::infra::lock::RepoLock;
@@ -201,6 +202,7 @@ pub fn run(payload: &Value) -> Result<()> {
                 &snapshot,
                 &message,
             )?;
+            maybe_fail("after_commit_object")?;
             let intent = CheckpointIntent {
                 version: 1,
                 ts: now,
@@ -224,11 +226,13 @@ pub fn run(payload: &Value) -> Result<()> {
                 checkpoint_commit_oid: prepared.commit_oid.clone(),
                 phase: IntentPhase::Prepared,
             })?;
+            maybe_fail("after_prepared")?;
             git.update_ref_cas(
                 &stream.hidden_ref,
                 &prepared.commit_oid,
                 Some(&manager.anchor.checkpoint_commit_oid),
             )?;
+            maybe_fail("after_hidden_ref_cas")?;
             stores.intents.append(&CheckpointIntent {
                 phase: IntentPhase::RefUpdated,
                 ..intent.clone()
@@ -240,6 +244,7 @@ pub fn run(payload: &Value) -> Result<()> {
                 checkpoint_commit_oid: prepared.commit_oid.clone(),
                 phase: IntentPhase::RefUpdated,
             })?;
+            maybe_fail("after_ref_updated")?;
 
             manager.generation += 1;
             manager.anchor = AnchorState {
@@ -257,6 +262,7 @@ pub fn run(payload: &Value) -> Result<()> {
             manager.last_seen = Some(last_seen(&snapshot, now, &head));
             stores.manifests.put(&snapshot.manifest_id, &snapshot)?;
             stores.manager.save(&manager)?;
+            maybe_fail("after_cache_save")?;
             stores.intents.append(&CheckpointIntent {
                 phase: IntentPhase::Finalized,
                 ..intent.clone()
@@ -268,7 +274,9 @@ pub fn run(payload: &Value) -> Result<()> {
                 checkpoint_commit_oid: prepared.commit_oid.clone(),
                 phase: IntentPhase::Finalized,
             })?;
+            maybe_fail("after_finalized")?;
             stores.turns.delete(&turn.session_id, &turn.turn_id)?;
+            maybe_fail("after_turn_delete")?;
             (
                 "materialized".to_string(),
                 Some(source),

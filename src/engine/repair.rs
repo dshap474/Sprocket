@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use crate::domain::ids::snapshot_fingerprint;
-use crate::domain::intent::{CheckpointIntent, IntentPhase};
+use crate::domain::intent::{CheckpointIntent, IntentPhase, latest_intents_by_id};
 use crate::domain::journal::JournalEvent;
 use crate::domain::manager::{AnchorState, ManagerState};
 use crate::domain::manifest::{StrictEntry, StrictSnapshot};
@@ -20,8 +20,15 @@ pub fn reconcile_stream_state(
 ) -> Result<Option<ManagerState>> {
     let hidden_ref_oid = git.rev_parse_ref(&stream.hidden_ref)?;
     let intents = stores.intents.load_all()?;
+    let latest_intents = latest_intents_by_id(&intents);
 
-    reconcile_latest_intent(stores, stream, now, hidden_ref_oid.as_deref(), &intents)?;
+    reconcile_intents(
+        stores,
+        stream,
+        now,
+        hidden_ref_oid.as_deref(),
+        &latest_intents,
+    )?;
 
     let Some(commit_oid) = hidden_ref_oid else {
         stores.manager.delete()?;
@@ -73,7 +80,7 @@ pub fn reconcile_stream_state(
         })?;
     }
 
-    finalize_latest_intent_if_needed(stores, stream, now, &manager, &intents)?;
+    finalize_current_tip_intent_if_needed(stores, stream, now, &manager, &latest_intents)?;
     Ok(Some(manager))
 }
 
@@ -157,36 +164,58 @@ pub fn build_manager_from_hidden_ref(input: HiddenRefManagerInput<'_>) -> Manage
     }
 }
 
-fn reconcile_latest_intent(
+fn reconcile_intents(
     stores: &Stores,
     stream: &StreamIdentity,
     now: i64,
     hidden_ref_oid: Option<&str>,
     intents: &[CheckpointIntent],
 ) -> Result<()> {
-    let Some(latest) = intents.last() else {
-        return Ok(());
-    };
-    if latest.phase != IntentPhase::Prepared {
-        return Ok(());
+    for latest in intents {
+        match latest.phase {
+            IntentPhase::Prepared => {
+                if hidden_ref_oid == Some(latest.checkpoint_commit_oid.as_str()) {
+                    append_intent_phase(stores, stream, now, latest, IntentPhase::RefUpdated)?;
+                } else {
+                    append_intent_phase(stores, stream, now, latest, IntentPhase::Aborted)?;
+                }
+            }
+            IntentPhase::RefUpdated | IntentPhase::Finalized | IntentPhase::Aborted => {}
+        }
     }
-    if hidden_ref_oid == Some(latest.checkpoint_commit_oid.as_str()) {
-        stores.intents.append(&CheckpointIntent {
-            phase: IntentPhase::RefUpdated,
-            ts: now,
-            ..latest.clone()
-        })?;
-        stores.journal.append(&JournalEvent::IntentTransition {
-            ts: now,
-            stream_id: stream.stream_id.clone(),
-            intent_id: latest.intent_id.clone(),
-            checkpoint_commit_oid: latest.checkpoint_commit_oid.clone(),
-            phase: IntentPhase::RefUpdated,
-        })?;
-        return Ok(());
+    Ok(())
+}
+
+fn finalize_current_tip_intent_if_needed(
+    stores: &Stores,
+    stream: &StreamIdentity,
+    now: i64,
+    manager: &ManagerState,
+    intents: &[CheckpointIntent],
+) -> Result<()> {
+    for latest in intents {
+        if latest.checkpoint_commit_oid != manager.anchor.checkpoint_commit_oid {
+            continue;
+        }
+        if matches!(
+            latest.phase,
+            IntentPhase::Prepared | IntentPhase::RefUpdated
+        ) {
+            append_intent_phase(stores, stream, now, latest, IntentPhase::Finalized)?;
+        }
     }
+    Ok(())
+}
+
+fn append_intent_phase(
+    stores: &Stores,
+    stream: &StreamIdentity,
+    now: i64,
+    latest: &CheckpointIntent,
+    phase: IntentPhase,
+) -> Result<()> {
     stores.intents.append(&CheckpointIntent {
-        phase: IntentPhase::Aborted,
+        phase,
         ts: now,
         ..latest.clone()
     })?;
@@ -195,46 +224,7 @@ fn reconcile_latest_intent(
         stream_id: stream.stream_id.clone(),
         intent_id: latest.intent_id.clone(),
         checkpoint_commit_oid: latest.checkpoint_commit_oid.clone(),
-        phase: IntentPhase::Aborted,
-    })?;
-    Ok(())
-}
-
-fn finalize_latest_intent_if_needed(
-    stores: &Stores,
-    stream: &StreamIdentity,
-    now: i64,
-    manager: &ManagerState,
-    intents: &[CheckpointIntent],
-) -> Result<()> {
-    let Some(latest) = intents.last() else {
-        return Ok(());
-    };
-    if latest.checkpoint_commit_oid != manager.anchor.checkpoint_commit_oid {
-        return Ok(());
-    }
-    if matches!(latest.phase, IntentPhase::Finalized | IntentPhase::Aborted) {
-        return Ok(());
-    }
-    if !matches!(
-        latest.phase,
-        IntentPhase::Prepared | IntentPhase::RefUpdated
-    ) {
-        return Ok(());
-    }
-
-    let finalized = CheckpointIntent {
-        phase: IntentPhase::Finalized,
-        ts: now,
-        ..latest.clone()
-    };
-    stores.intents.append(&finalized)?;
-    stores.journal.append(&JournalEvent::IntentTransition {
-        ts: now,
-        stream_id: stream.stream_id.clone(),
-        intent_id: finalized.intent_id.clone(),
-        checkpoint_commit_oid: finalized.checkpoint_commit_oid.clone(),
-        phase: IntentPhase::Finalized,
+        phase,
     })?;
     Ok(())
 }

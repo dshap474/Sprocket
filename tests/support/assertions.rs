@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine;
 
+use sprocket::domain::intent::CheckpointIntent;
 use sprocket::domain::journal::JournalEvent;
 use sprocket::domain::manager::ManagerState;
 use sprocket::domain::manifest::StrictSnapshot;
@@ -56,6 +57,18 @@ pub fn hidden_ref_oid(repo: &TestRepo, refname: &str) -> Option<String> {
 
 pub fn read_journal(stream_root: &Path) -> Vec<JournalEvent> {
     let path = stream_root.join("journal/events.ndjson");
+    if !path.exists() {
+        return Vec::new();
+    }
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+pub fn read_intents(stream_root: &Path) -> Vec<CheckpointIntent> {
+    let path = stream_root.join("intents/events.ndjson");
     if !path.exists() {
         return Vec::new();
     }

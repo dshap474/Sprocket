@@ -1,5 +1,6 @@
 pub mod atomic_write;
 pub mod clock;
+pub mod failpoint;
 pub mod git;
 pub mod git_cli;
 pub mod journal_store;

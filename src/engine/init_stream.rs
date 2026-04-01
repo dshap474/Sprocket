@@ -14,6 +14,7 @@ use crate::engine::repair::{
     HiddenRefManagerInput, build_manager_from_hidden_ref, policy_epoch_changed,
     reconcile_stream_state,
 };
+use crate::infra::failpoint::maybe_fail;
 use crate::infra::git::GitBackend;
 use crate::infra::store::Stores;
 
@@ -172,6 +173,7 @@ fn bootstrap_anchor(
         &snapshot,
         &message,
     )?;
+    maybe_fail("after_commit_object")?;
     let intent = CheckpointIntent {
         version: 1,
         ts: now,
@@ -195,7 +197,9 @@ fn bootstrap_anchor(
         checkpoint_commit_oid: intent.checkpoint_commit_oid.clone(),
         phase: IntentPhase::Prepared,
     })?;
+    maybe_fail("after_prepared")?;
     git.update_ref_cas(&stream.hidden_ref, &prepared.commit_oid, None)?;
+    maybe_fail("after_hidden_ref_cas")?;
     let ref_updated = CheckpointIntent {
         phase: IntentPhase::RefUpdated,
         ..intent.clone()
@@ -208,6 +212,7 @@ fn bootstrap_anchor(
         checkpoint_commit_oid: ref_updated.checkpoint_commit_oid.clone(),
         phase: IntentPhase::RefUpdated,
     })?;
+    maybe_fail("after_ref_updated")?;
 
     stores.manifests.put(&snapshot.manifest_id, &snapshot)?;
     let manager = build_manager_from_hidden_ref(HiddenRefManagerInput {
@@ -223,6 +228,7 @@ fn bootstrap_anchor(
         snapshot: &snapshot,
     });
     stores.manager.save(&manager)?;
+    maybe_fail("after_cache_save")?;
     stores.intents.append(&CheckpointIntent {
         phase: IntentPhase::Finalized,
         ..intent
@@ -234,5 +240,6 @@ fn bootstrap_anchor(
         checkpoint_commit_oid: prepared.commit_oid.clone(),
         phase: IntentPhase::Finalized,
     })?;
+    maybe_fail("after_finalized")?;
     Ok(manager)
 }
