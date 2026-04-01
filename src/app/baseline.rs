@@ -1,9 +1,9 @@
-use std::time::Duration;
-
 use anyhow::Result;
 use serde_json::Value;
 
-use crate::app::support::{ensure_supported_repo, load_policy};
+use crate::app::support::{
+    RepoSupportContext, ensure_supported_repo, journal_lock_busy, load_policy,
+};
 use crate::cli::resolve_repo_from_target;
 use crate::codex::payload::{cwd, session_id, turn_id};
 use crate::domain::journal::JournalEvent;
@@ -27,15 +27,24 @@ pub fn run(payload: &Value) -> Result<()> {
     let stores = Stores::for_stream(runtime, &stream.stream_id);
     let policy = load_policy(&git, &stores, &stream, "baseline", now)?;
     let repo_state = git.repo_state()?;
-    if !ensure_supported_repo(&stores, &stream, "baseline", now, &repo_state, &policy)? {
+    if !ensure_supported_repo(RepoSupportContext {
+        git: &git,
+        stores: &stores,
+        stream: &stream,
+        hook: "baseline",
+        now,
+        head: &head,
+        repo_state: &repo_state,
+        policy: &policy,
+    })? {
         return Ok(());
     }
-    let _lock = match RepoLock::try_acquire(
-        &stores.lock_path,
-        Duration::from_secs(policy.checkpoint.lock_timeout_seconds),
-    )? {
+    let _lock = match RepoLock::try_acquire(&stores.lock_path)? {
         Some(lock) => lock,
-        None => return Ok(()),
+        None => {
+            journal_lock_busy(&stores, &stream, "baseline", now)?;
+            return Ok(());
+        }
     };
 
     let manager = ensure_stream_initialized(&git, &stores, &stream, &head, now, &policy)?;
@@ -43,17 +52,17 @@ pub fn run(payload: &Value) -> Result<()> {
     stores.manifests.put(&snapshot.manifest_id, &snapshot)?;
 
     let turn = TurnState {
-        version: 2,
+        version: 3,
         session_id: session_id(payload),
         turn_id: turn_id(payload),
         stream_id_at_start: stream.stream_id.clone(),
+        stream_class_at_start: stream.class.clone(),
+        policy_epoch_at_start: policy.policy_epoch().0,
         started_at: now,
-        baseline_fingerprint: snapshot.fingerprint.clone(),
+        baseline_materialized_fingerprint: snapshot.materialized_fingerprint.clone(),
         baseline_manifest_id: snapshot.manifest_id.clone(),
-        anchor_fingerprint_at_start: manager.anchor.fingerprint.clone(),
+        anchor_materialized_fingerprint_at_start: manager.anchor.materialized_fingerprint.clone(),
         anchor_manifest_id_at_start: manager.anchor.manifest_id.clone(),
-        pending_promotion_commit_oid: None,
-        pending_promotion_head_oid: None,
     };
     stores.turns.save(&turn)?;
     refresh_session(&stores, &turn.session_id, &stream.stream_id, now)?;
@@ -62,7 +71,7 @@ pub fn run(payload: &Value) -> Result<()> {
         session_id: turn.session_id,
         turn_id: turn.turn_id,
         stream_id: stream.stream_id,
-        baseline_fingerprint: snapshot.fingerprint,
+        baseline_materialized_fingerprint: snapshot.materialized_fingerprint,
     })?;
     Ok(())
 }

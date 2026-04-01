@@ -1,9 +1,9 @@
-use std::time::Duration;
-
 use anyhow::Result;
 use serde_json::Value;
 
-use crate::app::support::{ensure_supported_repo, load_policy};
+use crate::app::support::{
+    RepoSupportContext, ensure_supported_repo, journal_lock_busy, load_policy,
+};
 use crate::cli::resolve_repo_from_target;
 use crate::codex::payload::{cwd, session_id};
 use crate::engine::init_stream::{
@@ -28,21 +28,30 @@ pub fn run(payload: &Value) -> Result<()> {
     let stores = Stores::for_stream(runtime, &stream.stream_id);
     let policy = load_policy(&git, &stores, &stream, "session-start", now)?;
     let repo_state = git.repo_state()?;
-    if !ensure_supported_repo(&stores, &stream, "session-start", now, &repo_state, &policy)? {
+    if !ensure_supported_repo(RepoSupportContext {
+        git: &git,
+        stores: &stores,
+        stream: &stream,
+        hook: "session-start",
+        now,
+        head: &head,
+        repo_state: &repo_state,
+        policy: &policy,
+    })? {
         return Ok(());
     }
-    let _lock = match RepoLock::try_acquire(
-        &stores.lock_path,
-        Duration::from_secs(policy.checkpoint.lock_timeout_seconds),
-    )? {
+    let _lock = match RepoLock::try_acquire(&stores.lock_path)? {
         Some(lock) => lock,
-        None => return Ok(()),
+        None => {
+            journal_lock_busy(&stores, &stream, "session-start", now)?;
+            return Ok(());
+        }
     };
 
     let mut manager = ensure_stream_initialized(&git, &stores, &stream, &head, now, &policy)?;
     let current = capture_strict_snapshot(git.repo_root(), &git, &policy)?;
     stores.manifests.put(&current.manifest_id, &current)?;
-    if current.fingerprint != manager.anchor.fingerprint {
+    if current.materialized_fingerprint != manager.anchor.materialized_fingerprint {
         manager.pending = Some(adopt_pending_snapshot(
             manager.pending.take(),
             &session_id(payload),
@@ -53,7 +62,8 @@ pub fn run(payload: &Value) -> Result<()> {
         manager.pending = None;
     }
     manager.last_seen = Some(crate::domain::session::Observation {
-        fingerprint: current.fingerprint.clone(),
+        materialized_fingerprint: current.materialized_fingerprint.clone(),
+        observed_fingerprint: current.observed_fingerprint.clone(),
         manifest_id: current.manifest_id.clone(),
         seen_at: now,
         observed_head_oid: head.oid.clone(),

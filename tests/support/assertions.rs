@@ -31,6 +31,13 @@ pub fn stream_root(repo: &TestRepo, stream_id: &str) -> PathBuf {
     runtime_root(repo).join("streams").join(stream_id)
 }
 
+pub fn turn_path(repo: &TestRepo, session_id: &str, turn_id: &str) -> PathBuf {
+    runtime_root(repo)
+        .join("turns")
+        .join(encode_runtime_key(session_id))
+        .join(format!("{}.json", encode_runtime_key(turn_id)))
+}
+
 pub fn hidden_ref_oid(repo: &TestRepo, refname: &str) -> Option<String> {
     let output = std::process::Command::new("git")
         .arg("rev-parse")
@@ -69,4 +76,11 @@ pub fn decode_runtime_key(value: &str) -> String {
         .decode(encoded)
         .unwrap();
     String::from_utf8(bytes).unwrap()
+}
+
+pub fn encode_runtime_key(value: &str) -> String {
+    format!(
+        "k-{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.as_bytes())
+    )
 }

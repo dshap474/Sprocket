@@ -5,6 +5,8 @@ use serde_json::json;
 use sprocket::domain::ids::compute_stream_identity;
 use sprocket::infra::git::GitBackend;
 use sprocket::infra::git_cli::GitCli;
+use sprocket::infra::lock::RepoLock;
+use std::process::Command;
 
 use support::assertions::{
     hidden_ref_oid, manager_for_stream, read_journal, runtime_root, stream_root,
@@ -110,6 +112,83 @@ fn sparse_checkout_noops_before_mutation() {
             .join("manager.json")
             .exists()
     );
+    assert!(hidden_ref_oid(&repo, &stream.hidden_ref).is_none());
+}
+
+#[test]
+fn gitattributes_repo_is_rejected_early() {
+    let repo = TestRepo::new();
+    repo.write(".gitattributes", "* text=auto\n");
+    repo.write("src/lib.rs", "pub fn a() {}\n");
+    repo.commit_all("init");
+
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "session-start"],
+        Some(&payloads::session_start(&repo.root, "s1")),
+        &[],
+    )
+    .assert_success();
+
+    let git = GitCli::discover(&repo.root).unwrap();
+    let stream = compute_stream_identity(&repo.root, &git.head_state().unwrap());
+    let journal = read_journal(&stream_root(&repo, &stream.stream_id));
+    assert!(journal.iter().any(|event| matches!(
+        event,
+        sprocket::domain::journal::JournalEvent::HookNoop { reason, .. }
+            if reason == "gitattributes-unsupported"
+    )));
+    assert!(hidden_ref_oid(&repo, &stream.hidden_ref).is_none());
+}
+
+#[test]
+fn gitlinks_are_rejected_early() {
+    let repo = TestRepo::new();
+    repo.write("src/lib.rs", "pub fn a() {}\n");
+    repo.commit_all("init");
+
+    let submodule = TestRepo::new();
+    submodule.write("README.md", "submodule\n");
+    submodule.commit_all("init");
+    let output = Command::new("git")
+        .args([
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            submodule.root.to_str().unwrap(),
+            "vendor/submodule",
+        ])
+        .current_dir(&repo.root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "failed to add submodule\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "add submodule"]);
+
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "session-start"],
+        Some(&payloads::session_start(&repo.root, "s1")),
+        &[],
+    )
+    .assert_success();
+
+    let git = GitCli::discover(&repo.root).unwrap();
+    let stream = compute_stream_identity(&repo.root, &git.head_state().unwrap());
+    let journal = read_journal(&stream_root(&repo, &stream.stream_id));
+    assert!(journal.iter().any(|event| matches!(
+        event,
+        sprocket::domain::journal::JournalEvent::HookNoop { reason, .. }
+            if reason == "gitlinks-unsupported"
+    )));
     assert!(hidden_ref_oid(&repo, &stream.hidden_ref).is_none());
 }
 
@@ -243,31 +322,14 @@ fn session_start_supports_sha256_repos_when_git_supports_them() {
 }
 
 #[test]
-fn stale_lock_is_reaped_and_journaled_flow_continues() {
+fn lock_contention_is_journaled_and_noops() {
     let repo = TestRepo::new();
     repo.write("src/lib.rs", "pub fn a() {}\n");
     repo.commit_all("init");
-    std::fs::create_dir_all(repo.root.join(".sprocket")).unwrap();
-    std::fs::write(
-        repo.root.join(".sprocket/policy.toml"),
-        r#"
-version = 2
-[owned]
-include = ["."]
-exclude = [":(exclude).git",":(exclude).sprocket",":(exclude)node_modules",":(exclude)target",":(exclude)dist",":(exclude)build",":(exclude).next",":(exclude)coverage",":(exclude).venv"]
-[checkpoint]
-mode = "hidden_only"
-turn_threshold = 2
-file_threshold = 4
-age_minutes = 20
-default_area = "core"
-message_template = "checkpoint({area}): save current work [auto]"
-lock_timeout_seconds = 0
-"#,
-    )
-    .unwrap();
     std::fs::create_dir_all(runtime_root(&repo)).unwrap();
-    std::fs::write(runtime_root(&repo).join("checkpoint.lock"), b"stale\n").unwrap();
+    let _lock = RepoLock::try_acquire(&runtime_root(&repo).join("checkpoint.lock"))
+        .unwrap()
+        .unwrap();
 
     run(
         &repo.root,
@@ -281,13 +343,120 @@ lock_timeout_seconds = 0
     let git = GitCli::discover(&repo.root).unwrap();
     let stream = compute_stream_identity(&repo.root, &git.head_state().unwrap());
     let journal = read_journal(&stream_root(&repo, &stream.stream_id));
+    assert!(journal.iter().any(|event| matches!(
+        event,
+        sprocket::domain::journal::JournalEvent::HookNoop { reason, .. }
+            if reason == "lock-busy"
+    )));
     assert!(
-        stream_root(&repo, &stream.stream_id)
+        !stream_root(&repo, &stream.stream_id)
             .join("manager.json")
+            .exists()
+    );
+}
+
+#[test]
+fn existing_hidden_ref_recovers_missing_manager() {
+    let repo = TestRepo::new();
+    repo.write("src/lib.rs", "pub fn a() {}\n");
+    repo.commit_all("init");
+
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "session-start"],
+        Some(&payloads::session_start(&repo.root, "s1")),
+        &[],
+    )
+    .assert_success();
+
+    let git = GitCli::discover(&repo.root).unwrap();
+    let stream = compute_stream_identity(&repo.root, &git.head_state().unwrap());
+    let stream_root = stream_root(&repo, &stream.stream_id);
+    let hidden_oid = hidden_ref_oid(&repo, &stream.hidden_ref).unwrap();
+    std::fs::remove_file(stream_root.join("manager.json")).unwrap();
+
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "session-start"],
+        Some(&payloads::session_start(&repo.root, "s2")),
+        &[],
+    )
+    .assert_success();
+
+    let manager = manager_for_stream(&stream_root);
+    let journal = read_journal(&stream_root);
+    assert_eq!(manager.anchor.checkpoint_commit_oid, hidden_oid);
+    assert!(journal.iter().any(|event| matches!(
+        event,
+        sprocket::domain::journal::JournalEvent::Recovery { reason, .. }
+            if reason == "rebuilt-caches-from-hidden-ref"
+    )));
+}
+
+#[test]
+fn missing_anchor_manifest_is_recovered_from_hidden_commit() {
+    let repo = TestRepo::new();
+    repo.write("src/lib.rs", "pub fn a() {}\n");
+    repo.commit_all("init");
+
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "session-start"],
+        Some(&payloads::session_start(&repo.root, "s1")),
+        &[],
+    )
+    .assert_success();
+
+    let git = GitCli::discover(&repo.root).unwrap();
+    let stream = compute_stream_identity(&repo.root, &git.head_state().unwrap());
+    let stream_root = stream_root(&repo, &stream.stream_id);
+    let manager = manager_for_stream(&stream_root);
+    let manifest_path = stream_root
+        .join("manifests")
+        .join(format!("{}.json.zst", manager.anchor.manifest_id));
+    std::fs::remove_file(&manifest_path).unwrap();
+
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "session-start"],
+        Some(&payloads::session_start(&repo.root, "s2")),
+        &[],
+    )
+    .assert_success();
+
+    let repaired = manager_for_stream(&stream_root);
+    let journal = read_journal(&stream_root);
+    assert!(
+        stream_root
+            .join("manifests")
+            .join(format!("{}.json.zst", repaired.anchor.manifest_id))
             .exists()
     );
     assert!(journal.iter().any(|event| matches!(
         event,
-        sprocket::domain::journal::JournalEvent::SessionStart { .. }
+        sprocket::domain::journal::JournalEvent::Recovery { reason, .. }
+            if reason == "rebuilt-caches-from-hidden-ref"
     )));
+}
+
+#[test]
+fn hidden_checkpoint_does_not_require_git_identity_config() {
+    let repo = TestRepo::new();
+    repo.write("src/lib.rs", "pub fn a() {}\n");
+    repo.commit_all("init");
+    repo.git(&["config", "--unset", "user.name"]);
+    repo.git(&["config", "--unset", "user.email"]);
+
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "session-start"],
+        Some(&payloads::session_start(&repo.root, "s1")),
+        &[],
+    )
+    .assert_success();
 }

@@ -1,69 +1,64 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
+
+use anyhow::Result;
+use uuid::Uuid;
 
 pub struct RepoLock {
     path: PathBuf,
-    _file: File,
+    owner_id: String,
+    file: File,
 }
 
 impl RepoLock {
-    pub fn try_acquire(path: &Path, stale_after: Duration) -> anyhow::Result<Option<Self>> {
+    pub fn try_acquire(path: &Path) -> Result<Option<Self>> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        match OpenOptions::new().create_new(true).write(true).open(path) {
-            Ok(mut file) => {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
+        match file.try_lock() {
+            Ok(()) => {
+                let owner_id = Uuid::new_v4().to_string();
+                file.set_len(0)?;
+                file.seek(SeekFrom::Start(0))?;
                 writeln!(
                     file,
-                    "pid={} acquired_at={}",
-                    std::process::id(),
-                    current_unix()
-                )?;
-                file.sync_all()?;
-                return Ok(Some(Self {
-                    path: path.to_path_buf(),
-                    _file: file,
-                }));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
-
-        let meta = fs::metadata(path)?;
-        let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        let age = SystemTime::now()
-            .duration_since(modified)
-            .unwrap_or_default();
-        if age < stale_after {
-            return Ok(None);
-        }
-
-        let _ = fs::remove_file(path);
-        match OpenOptions::new().create_new(true).write(true).open(path) {
-            Ok(mut file) => {
-                writeln!(
-                    file,
-                    "pid={} reacquired_at={}",
+                    "owner_id={} pid={} acquired_at={}",
+                    owner_id,
                     std::process::id(),
                     current_unix()
                 )?;
                 file.sync_all()?;
                 Ok(Some(Self {
                     path: path.to_path_buf(),
-                    _file: file,
+                    owner_id,
+                    file,
                 }))
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(error) => Err(error.into()),
         }
+    }
+
+    pub fn owner_id(&self) -> &str {
+        &self.owner_id
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 }
 
 impl Drop for RepoLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = self.file.unlock();
     }
 }
 

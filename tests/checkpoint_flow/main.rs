@@ -5,7 +5,7 @@ use sprocket::domain::ids::compute_stream_identity;
 use sprocket::infra::git::GitBackend;
 use sprocket::infra::git_cli::GitCli;
 
-use support::assertions::{manager_for_stream, stream_root};
+use support::assertions::{manager_for_stream, stream_root, turn_path};
 use support::cmd::run;
 use support::payloads;
 use support::repo::TestRepo;
@@ -214,7 +214,7 @@ lock_timeout_seconds = 300
 }
 
 #[test]
-fn stream_switch_and_detached_head_are_isolated() {
+fn stream_switch_discards_global_turn_and_detached_head_is_rejected() {
     let repo = TestRepo::new();
     repo.write("src/lib.rs", "pub fn a() {}\n");
     repo.commit_all("init");
@@ -235,6 +235,7 @@ fn stream_switch_and_detached_head_are_isolated() {
         &[],
     )
     .assert_success();
+    assert!(turn_path(&repo, "s1", "t1").exists());
     repo.git(&["checkout", "-b", "feature"]);
     run(
         &repo.root,
@@ -244,18 +245,79 @@ fn stream_switch_and_detached_head_are_isolated() {
         &[],
     )
     .assert_success();
+    assert!(!turn_path(&repo, "s1", "t1").exists());
     repo.git(&["checkout", "--detach"]);
-    run(
+    let detached = run(
         &repo.root,
         &repo.hermetic,
         &["hook", "codex", "session-start"],
         Some(&payloads::session_start(&repo.root, "s2")),
         &[],
-    )
-    .assert_success();
+    );
+    detached.assert_success();
     let git = GitCli::discover(&repo.root).unwrap();
     let stream = compute_stream_identity(&repo.root, &git.head_state().unwrap());
+    let journal = support::assertions::read_journal(&stream_root(&repo, &stream.stream_id));
     assert!(stream.display_name.starts_with("detached:"));
+    assert!(journal.iter().any(|event| matches!(
+        event,
+        sprocket::domain::journal::JournalEvent::HookNoop { reason, .. }
+            if reason == "detached-head-unsupported"
+    )));
+}
+
+#[test]
+fn long_tracked_paths_are_enumerated_without_tar_parsing() {
+    let repo = TestRepo::new();
+    let long_name = format!("src/{}/lib.rs", "a".repeat(120));
+    repo.write(&long_name, "pub fn a() {}\n");
+    repo.commit_all("init");
+    set_policy(
+        &repo,
+        r#"
+version = 2
+[owned]
+include = ["."]
+exclude = [":(exclude).git",":(exclude).sprocket",":(exclude)node_modules",":(exclude)target",":(exclude)dist",":(exclude)build",":(exclude).next",":(exclude)coverage",":(exclude).venv"]
+[checkpoint]
+mode = "hidden_only"
+turn_threshold = 9
+file_threshold = 1
+age_minutes = 20
+default_area = "core"
+message_template = "checkpoint({area}): save current work [auto]"
+lock_timeout_seconds = 300
+"#,
+    );
+
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "session-start"],
+        Some(&payloads::session_start(&repo.root, "s1")),
+        &[],
+    )
+    .assert_success();
+
+    std::fs::remove_file(repo.root.join(&long_name)).unwrap();
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "baseline"],
+        Some(&payloads::baseline(&repo.root, "s1", "t1")),
+        &[],
+    )
+    .assert_success();
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "checkpoint"],
+        Some(&payloads::checkpoint(&repo.root, "s1", "t1")),
+        &[],
+    )
+    .assert_success();
+
+    assert_eq!(stream_manager(&repo).generation, 2);
 }
 
 #[test]

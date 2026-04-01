@@ -1,3 +1,8 @@
+#![cfg_attr(not(unix), allow(dead_code))]
+
+#[cfg(not(unix))]
+compile_error!("Sprocket currently supports Unix targets only.");
+
 pub mod app;
 mod cli;
 pub mod codex;

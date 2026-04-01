@@ -4,12 +4,25 @@ use crate::domain::repopath::RepoPath;
 use crate::domain::session::{HeadState, RepoState};
 use crate::infra::temp_index::TempIndex;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeEntry {
+    pub mode: u32,
+    pub kind: String,
+    pub oid: String,
+    pub path: RepoPath,
+}
+
 pub trait GitBackend {
     fn repo_root(&self) -> &Path;
     fn git_path(&self, name: &str) -> anyhow::Result<PathBuf>;
     fn head_state(&self) -> anyhow::Result<HeadState>;
     fn repo_state(&self) -> anyhow::Result<RepoState>;
     fn path_exists_in_worktree(&self, path: &RepoPath) -> bool;
+    fn list_tree_entries(
+        &self,
+        treeish: &str,
+        pathspecs: &[String],
+    ) -> anyhow::Result<Vec<TreeEntry>>;
     fn list_present_paths(&self, pathspecs: &[String]) -> anyhow::Result<Vec<RepoPath>>;
     fn list_head_owned_paths(
         &self,

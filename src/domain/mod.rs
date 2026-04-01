@@ -2,6 +2,7 @@ pub mod decision;
 pub mod delta;
 pub mod errors;
 pub mod ids;
+pub mod intent;
 pub mod journal;
 pub mod manager;
 pub mod manifest;

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::domain::intent::IntentPhase;
 use crate::domain::manager::PendingSource;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,7 +16,7 @@ pub enum JournalEvent {
         session_id: String,
         turn_id: String,
         stream_id: String,
-        baseline_fingerprint: String,
+        baseline_materialized_fingerprint: String,
     },
     StopDecision {
         ts: i64,
@@ -26,10 +27,12 @@ pub enum JournalEvent {
         source: Option<PendingSource>,
         commit_oid: Option<String>,
     },
-    PromotionSkipped {
+    IntentTransition {
         ts: i64,
         stream_id: String,
-        reason: String,
+        intent_id: String,
+        checkpoint_commit_oid: String,
+        phase: IntentPhase,
     },
     HookNoop {
         ts: i64,
@@ -42,5 +45,11 @@ pub enum JournalEvent {
         stream_id: String,
         hook: String,
         reason: String,
+    },
+    Recovery {
+        ts: i64,
+        stream_id: String,
+        reason: String,
+        commit_oid: Option<String>,
     },
 }

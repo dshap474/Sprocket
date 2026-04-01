@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+use crate::domain::ids::hash_hex;
+use crate::domain::repopath::RepoPath;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Policy {
@@ -58,6 +61,9 @@ pub struct GuardPolicy {
 pub struct CompatPolicy {
     pub allow_sparse_checkout: bool,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyEpoch(pub String);
 
 impl Default for Policy {
     fn default() -> Self {
@@ -125,10 +131,47 @@ impl Default for GuardPolicy {
 }
 
 impl Policy {
-    pub fn git_owned_pathspecs(&self) -> Vec<String> {
-        let mut pathspecs = self.owned.include.clone();
-        pathspecs.extend(self.owned.exclude.iter().cloned());
-        pathspecs
+    pub fn policy_epoch(&self) -> PolicyEpoch {
+        let mut payload = String::from("snapshot-schema:v1\n");
+        for rule in self.git_include_pathspecs() {
+            payload.push_str("include:");
+            payload.push_str(&rule);
+            payload.push('\n');
+        }
+        for rule in &self.owned.exclude {
+            payload.push_str("exclude:");
+            payload.push_str(rule);
+            payload.push('\n');
+        }
+        payload.push_str("allow_sparse_checkout:");
+        payload.push_str(if self.compat.allow_sparse_checkout {
+            "true"
+        } else {
+            "false"
+        });
+        PolicyEpoch(format!("policy:{}", hash_hex(payload.as_bytes())))
+    }
+
+    pub fn git_include_pathspecs(&self) -> Vec<String> {
+        if self.owned.include.is_empty() {
+            vec![".".to_string()]
+        } else {
+            self.owned.include.clone()
+        }
+    }
+
+    pub fn matches_owned_path(&self, path: &RepoPath) -> bool {
+        let included = self
+            .owned
+            .include
+            .iter()
+            .any(|rule| matches_rule(rule, path, false));
+        let excluded = self
+            .owned
+            .exclude
+            .iter()
+            .any(|rule| matches_rule(rule, path, true));
+        included && !excluded
     }
 
     pub fn checkpoint_subject(&self) -> String {
@@ -136,4 +179,31 @@ impl Policy {
             .message_template
             .replace("{area}", &self.checkpoint.default_area)
     }
+
+    pub fn hidden_only_mode(&self) -> bool {
+        matches!(self.checkpoint.mode, CheckpointMode::HiddenOnly)
+    }
+}
+
+fn matches_rule(rule: &str, path: &RepoPath, exclude_rule: bool) -> bool {
+    let raw = if exclude_rule {
+        rule.strip_prefix(":(exclude)").unwrap_or(rule)
+    } else {
+        rule
+    };
+    if raw == "." {
+        return true;
+    }
+
+    let raw = raw.trim_matches('/');
+    if raw.is_empty() {
+        return true;
+    }
+
+    let candidate = path.as_bytes();
+    let raw_bytes = raw.as_bytes();
+    candidate == raw_bytes
+        || candidate
+            .strip_prefix(raw_bytes)
+            .is_some_and(|suffix| suffix.first() == Some(&b'/'))
 }

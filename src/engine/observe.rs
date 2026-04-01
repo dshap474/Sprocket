@@ -15,7 +15,10 @@ pub fn capture_strict_snapshot(
     policy: &Policy,
 ) -> Result<StrictSnapshot> {
     let mut entries = Vec::new();
-    for path in git.list_present_paths(&policy.git_owned_pathspecs())? {
+    for path in git.list_present_paths(&policy.git_include_pathspecs())? {
+        if !policy.matches_owned_path(&path) {
+            continue;
+        }
         let abs = path.join_to(repo_root);
         let meta = fs::symlink_metadata(&abs)?;
 
@@ -38,22 +41,35 @@ pub fn capture_strict_snapshot(
         entries.push(StrictEntry {
             path,
             mode,
-            digest,
+            observed_digest: digest,
             git_oid,
         });
     }
 
     entries.sort_by(|left, right| left.path.cmp(&right.path));
-    let fingerprint = snapshot_fingerprint(
+    let materialized_fingerprint = snapshot_fingerprint(
         &entries
             .iter()
-            .map(|entry| (entry.path.as_bytes(), entry.mode, entry.digest.as_str()))
+            .map(|entry| (entry.path.as_bytes(), entry.mode, entry.git_oid.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let observed_fingerprint = snapshot_fingerprint(
+        &entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.path.as_bytes(),
+                    entry.mode,
+                    entry.observed_digest.as_str(),
+                )
+            })
             .collect::<Vec<_>>(),
     );
 
     Ok(StrictSnapshot {
-        fingerprint: fingerprint.clone(),
-        manifest_id: fingerprint,
+        materialized_fingerprint: materialized_fingerprint.clone(),
+        observed_fingerprint: Some(observed_fingerprint),
+        manifest_id: materialized_fingerprint,
         entries,
     })
 }

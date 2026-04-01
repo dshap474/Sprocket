@@ -81,7 +81,8 @@ fn classify_stream_change_noops() {
 #[test]
 fn reconcile_pending_merges_sources_and_sessions() {
     let snapshot = StrictSnapshot {
-        fingerprint: "blake3:1".into(),
+        materialized_fingerprint: "blake3:1".into(),
+        observed_fingerprint: Some("blake3:o1".into()),
         manifest_id: "blake3:1".into(),
         entries: Vec::new(),
     };

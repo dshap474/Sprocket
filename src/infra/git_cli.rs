@@ -13,7 +13,7 @@ use tempfile::NamedTempFile;
 use crate::domain::repopath::RepoPath;
 use crate::domain::session::{HeadState, RepoState};
 use crate::infra::atomic_write::atomic_write_bytes;
-use crate::infra::git::GitBackend;
+use crate::infra::git::{GitBackend, TreeEntry};
 use crate::infra::temp_index::TempIndex;
 
 #[derive(Debug, Clone)]
@@ -117,20 +117,22 @@ impl GitCli {
             .collect()
     }
 
-    fn tracked_paths_from_tree(
+    fn tree_entries_from_tree(
         &self,
         treeish: &str,
         pathspecs: &[String],
-    ) -> Result<Vec<RepoPath>> {
+    ) -> Result<Vec<TreeEntry>> {
         let mut args: Vec<OsString> = vec![
-            OsString::from("archive"),
-            OsString::from("--format=tar"),
+            OsString::from("ls-tree"),
+            OsString::from("-r"),
+            OsString::from("-z"),
+            OsString::from("--full-tree"),
             OsString::from(treeish),
             OsString::from("--"),
         ];
         args.extend(pathspecs.iter().map(OsString::from));
         let out = self.run(args)?;
-        Ok(parse_tar_paths(&out.stdout))
+        parse_tree_entries(&out.stdout)
     }
 
     fn status_paths(&self, pathspecs: &[String]) -> Result<Vec<RepoPath>> {
@@ -217,6 +219,7 @@ impl GitBackend for GitCli {
             rebase_in_progress: self.git_path("rebase-merge")?.exists()
                 || self.git_path("rebase-apply")?.exists(),
             cherry_pick_in_progress: self.git_path("CHERRY_PICK_HEAD")?.exists(),
+            sequencer_in_progress: self.git_path("sequencer")?.exists(),
             sparse_checkout: String::from_utf8_lossy(&sparse).trim() == "true",
         })
     }
@@ -225,12 +228,16 @@ impl GitBackend for GitCli {
         fs::symlink_metadata(path.join_to(&self.repo_root)).is_ok()
     }
 
+    fn list_tree_entries(&self, treeish: &str, pathspecs: &[String]) -> Result<Vec<TreeEntry>> {
+        self.tree_entries_from_tree(treeish, pathspecs)
+    }
+
     fn list_present_paths(&self, pathspecs: &[String]) -> Result<Vec<RepoPath>> {
         let mut seen = BTreeSet::new();
         if let Some(head_oid) = self.head_state()?.oid {
-            for path in self.tracked_paths_from_tree(&head_oid, pathspecs)? {
-                if self.path_exists_in_worktree(&path) {
-                    seen.insert(path);
+            for entry in self.tree_entries_from_tree(&head_oid, pathspecs)? {
+                if self.path_exists_in_worktree(&entry.path) {
+                    seen.insert(entry.path);
                 }
             }
         }
@@ -243,7 +250,11 @@ impl GitBackend for GitCli {
     }
 
     fn list_head_owned_paths(&self, head_oid: &str, pathspecs: &[String]) -> Result<Vec<RepoPath>> {
-        self.tracked_paths_from_tree(head_oid, pathspecs)
+        Ok(self
+            .tree_entries_from_tree(head_oid, pathspecs)?
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect())
     }
 
     fn hash_object_for_path(&self, path: &RepoPath, bytes: &[u8]) -> Result<String> {
@@ -337,7 +348,18 @@ impl GitBackend for GitCli {
             args.push(OsString::from("-p"));
             args.push(OsString::from(parent));
         }
-        let out = self.run(args)?;
+        let author_name = OsStr::new("Sprocket");
+        let author_email = OsStr::new("sprocket@local.invalid");
+        let out = self.run_with_env(
+            args,
+            &[
+                ("GIT_AUTHOR_NAME", author_name),
+                ("GIT_AUTHOR_EMAIL", author_email),
+                ("GIT_COMMITTER_NAME", author_name),
+                ("GIT_COMMITTER_EMAIL", author_email),
+            ],
+            None,
+        )?;
         Ok(String::from_utf8(out.stdout)?.trim().to_string())
     }
 
@@ -440,48 +462,38 @@ fn trim_trailing_newline(bytes: &[u8]) -> &[u8] {
         .unwrap_or(bytes)
 }
 
-fn parse_tar_paths(bytes: &[u8]) -> Vec<RepoPath> {
-    let mut paths = Vec::new();
-    let mut offset = 0usize;
-
-    while offset + 512 <= bytes.len() {
-        let header = &bytes[offset..offset + 512];
-        if header.iter().all(|byte| *byte == 0) {
-            break;
-        }
-
-        let name = tar_field(&header[..100]);
-        let prefix = tar_field(&header[345..500]);
-        let path = if prefix.is_empty() {
-            name.to_vec()
-        } else {
-            [prefix, b"/", name].concat()
+fn parse_tree_entries(bytes: &[u8]) -> Result<Vec<TreeEntry>> {
+    let mut entries = Vec::new();
+    for record in bytes.split_str(b"\0").filter(|entry| !entry.is_empty()) {
+        let mut fields = record.splitn(2, |byte| *byte == b'\t');
+        let Some(meta) = fields.next() else {
+            bail!("unexpected git ls-tree record format");
         };
-        let typeflag = header[156];
-        if !path.is_empty() && typeflag != b'5' {
-            paths.push(RepoPath::from_bytes(path));
-        }
-
-        let size = parse_tar_size(&header[124..136]);
-        let blocks = size.div_ceil(512);
-        offset += 512 + (blocks * 512);
+        let Some(path) = fields.next() else {
+            bail!("unexpected git ls-tree record format");
+        };
+        let mut parts = meta.split_str(b" ");
+        let mode = parts
+            .next()
+            .ok_or_else(|| anyhow!("missing tree entry mode"))?;
+        let kind = parts
+            .next()
+            .ok_or_else(|| anyhow!("missing tree entry type"))?;
+        let oid = parts
+            .next()
+            .ok_or_else(|| anyhow!("missing tree entry oid"))?;
+        let mode = u32::from_str_radix(&String::from_utf8_lossy(mode), 8)
+            .context("invalid tree entry mode")?;
+        entries.push(TreeEntry {
+            mode,
+            kind: String::from_utf8(kind.to_vec())
+                .map_err(|error| anyhow!("invalid tree entry type: {error}"))?,
+            oid: String::from_utf8(oid.to_vec())
+                .map_err(|error| anyhow!("invalid tree entry oid: {error}"))?,
+            path: RepoPath::from_bytes(path.to_vec()),
+        });
     }
-
-    paths
-}
-
-fn tar_field(bytes: &[u8]) -> &[u8] {
-    bytes.split(|byte| *byte == 0).next().unwrap_or(&[])
-}
-
-fn parse_tar_size(bytes: &[u8]) -> usize {
-    let trimmed = bytes
-        .iter()
-        .copied()
-        .take_while(|byte| *byte != 0)
-        .collect::<Vec<_>>();
-    let text = String::from_utf8_lossy(&trimmed);
-    usize::from_str_radix(text.trim(), 8).unwrap_or(0)
+    Ok(entries)
 }
 
 fn path_from_stdout(bytes: &[u8]) -> Result<PathBuf> {

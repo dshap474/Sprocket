@@ -5,7 +5,7 @@ use sprocket::domain::ids::compute_stream_identity;
 use sprocket::infra::git::GitBackend;
 use sprocket::infra::git_cli::GitCli;
 
-use support::assertions::{decode_runtime_key, read_journal, stream_root};
+use support::assertions::{decode_runtime_key, read_journal, runtime_root, stream_root};
 use support::cmd::run;
 use support::payloads;
 use support::repo::TestRepo;
@@ -65,9 +65,7 @@ fn runtime_keys_are_encoded() {
     )
     .assert_success();
 
-    let git = GitCli::discover(&repo.root).unwrap();
-    let stream = compute_stream_identity(&repo.root, &git.head_state().unwrap());
-    let session_dir = stream_root(&repo, &stream.stream_id)
+    let session_dir = runtime_root(&repo)
         .join("turns")
         .read_dir()
         .unwrap()
@@ -166,8 +164,6 @@ fn journal_records_noop_error_and_skip_paths() {
     )
     .assert_success();
     repo.write("src/lib.rs", "pub fn a() { println!(\"x\"); }\n");
-    repo.write("node_modules/pkg/index.js", "foreign\n");
-    repo.git(&["add", "node_modules/pkg/index.js"]);
     std::fs::create_dir_all(repo.root.join(".sprocket")).unwrap();
     std::fs::write(
         repo.root.join(".sprocket/policy.toml"),
@@ -218,8 +214,8 @@ continue_on_failure = true
     )));
     assert!(journal.iter().any(|event| matches!(
         event,
-        sprocket::domain::journal::JournalEvent::PromotionSkipped { reason, .. }
-            if reason == "foreign-staged-changes"
+        sprocket::domain::journal::JournalEvent::HookNoop { hook, reason, .. }
+            if hook == "baseline" && reason == "checkpoint-mode-unsupported"
     )));
 }
 

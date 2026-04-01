@@ -6,13 +6,14 @@ use crate::domain::repopath::RepoPath;
 pub struct StrictEntry {
     pub path: RepoPath,
     pub mode: u32,
-    pub digest: String,
+    pub observed_digest: String,
     pub git_oid: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StrictSnapshot {
-    pub fingerprint: String,
+    pub materialized_fingerprint: String,
+    pub observed_fingerprint: Option<String>,
     pub manifest_id: String,
     pub entries: Vec<StrictEntry>,
 }

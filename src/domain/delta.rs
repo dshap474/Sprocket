@@ -7,10 +7,10 @@ pub fn changed_path_count(old: &[StrictEntry], new: &[StrictEntry]) -> usize {
     let mut new_map = BTreeMap::new();
 
     for entry in old {
-        old_map.insert(entry.path.clone(), (entry.mode, entry.digest.as_str()));
+        old_map.insert(entry.path.clone(), (entry.mode, entry.git_oid.as_str()));
     }
     for entry in new {
-        new_map.insert(entry.path.clone(), (entry.mode, entry.digest.as_str()));
+        new_map.insert(entry.path.clone(), (entry.mode, entry.git_oid.as_str()));
     }
 
     let mut changed = 0usize;

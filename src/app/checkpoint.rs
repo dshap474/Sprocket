@@ -1,23 +1,23 @@
-use std::time::Duration;
-
 use anyhow::Result;
 use serde_json::Value;
+use uuid::Uuid;
 
-use crate::app::support::{ensure_supported_repo, load_policy};
+use crate::app::support::{
+    RepoSupportContext, ensure_supported_repo, journal_lock_busy, load_policy,
+};
 use crate::cli::resolve_repo_from_target;
 use crate::codex::payload::{cwd, session_id, turn_id};
-use crate::codex::responses::emit_stop_block;
-use crate::domain::decision::{Decision, NoopReason};
-use crate::domain::errors::SprocketError;
+use crate::domain::decision::{Decision, classify};
+use crate::domain::intent::{CheckpointIntent, IntentPhase};
 use crate::domain::journal::JournalEvent;
-use crate::domain::manager::reconcile_pending;
-use crate::domain::policy::Policy;
+use crate::domain::manager::{AnchorState, reconcile_pending};
 use crate::domain::session::Observation;
-use crate::engine::classify::{ClassifyInput, classify};
 use crate::engine::init_stream::{ensure_stream_initialized, resolve_stream};
-use crate::engine::materialize_hidden::{build_checkpoint_message, materialize_hidden_checkpoint};
+use crate::engine::materialize_hidden::{
+    CheckpointMessageContext, build_checkpoint_message, prepare_hidden_checkpoint,
+};
 use crate::engine::observe::capture_strict_snapshot;
-use crate::engine::promote_visible::{PromotionOutcome, maybe_promote_visible};
+use crate::engine::repair::snapshot_from_commit;
 use crate::infra::clock::{Clock, SystemClock};
 use crate::infra::git::GitBackend;
 use crate::infra::git_cli::GitCli;
@@ -35,68 +35,95 @@ pub fn run(payload: &Value) -> Result<()> {
     let stores = Stores::for_stream(runtime, &stream.stream_id);
     let policy = load_policy(&git, &stores, &stream, "checkpoint", now)?;
     let repo_state = git.repo_state()?;
-    if !ensure_supported_repo(&stores, &stream, "checkpoint", now, &repo_state, &policy)? {
+    if !ensure_supported_repo(RepoSupportContext {
+        git: &git,
+        stores: &stores,
+        stream: &stream,
+        hook: "checkpoint",
+        now,
+        head: &head,
+        repo_state: &repo_state,
+        policy: &policy,
+    })? {
         return Ok(());
     }
 
-    let _lock = match RepoLock::try_acquire(
-        &stores.lock_path,
-        Duration::from_secs(policy.checkpoint.lock_timeout_seconds),
-    )? {
+    let _lock = match RepoLock::try_acquire(&stores.lock_path)? {
         Some(lock) => lock,
-        None => return Ok(()),
+        None => {
+            journal_lock_busy(&stores, &stream, "checkpoint", now)?;
+            return Ok(());
+        }
     };
 
     let mut manager = ensure_stream_initialized(&git, &stores, &stream, &head, now, &policy)?;
-    let Some(mut turn) = stores.turns.load(&session_id(payload), &turn_id(payload))? else {
+    let Some(turn) = stores.turns.load(&session_id(payload), &turn_id(payload))? else {
         return Ok(());
     };
+
     if turn.stream_id_at_start != stream.stream_id {
         stores.turns.delete(&turn.session_id, &turn.turn_id)?;
+        stores.journal.append(&JournalEvent::StopDecision {
+            ts: now,
+            session_id: turn.session_id,
+            turn_id: turn.turn_id,
+            stream_id: stream.stream_id,
+            outcome: "stream-changed".to_string(),
+            source: None,
+            commit_oid: None,
+        })?;
+        return Ok(());
+    }
+    if turn.policy_epoch_at_start != manager.anchor.policy_epoch {
+        stores.turns.delete(&turn.session_id, &turn.turn_id)?;
+        stores.journal.append(&JournalEvent::StopDecision {
+            ts: now,
+            session_id: turn.session_id,
+            turn_id: turn.turn_id,
+            stream_id: stream.stream_id,
+            outcome: "policy-epoch-changed".to_string(),
+            source: None,
+            commit_oid: None,
+        })?;
         return Ok(());
     }
 
     let snapshot = capture_strict_snapshot(git.repo_root(), &git, &policy)?;
     stores.manifests.put(&snapshot.manifest_id, &snapshot)?;
-    let anchor_snapshot = stores
+    let anchor_snapshot = match stores
         .manifests
         .get::<crate::domain::manifest::StrictSnapshot>(&manager.anchor.manifest_id)
-        .map_err(|_| SprocketError::MissingAnchorManifest(manager.anchor.manifest_id.clone()))?;
+    {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            let recovered =
+                snapshot_from_commit(&git, &manager.anchor.checkpoint_commit_oid, &policy)?;
+            stores.manifests.put(&recovered.manifest_id, &recovered)?;
+            manager.anchor.manifest_id = recovered.manifest_id.clone();
+            manager.anchor.materialized_fingerprint = recovered.materialized_fingerprint.clone();
+            manager.anchor.observed_fingerprint = recovered.observed_fingerprint.clone();
+            stores.manager.save(&manager)?;
+            stores.journal.append(&JournalEvent::Recovery {
+                ts: now,
+                stream_id: stream.stream_id.clone(),
+                reason: "recovered-anchor-manifest-from-hidden-ref".to_string(),
+                commit_oid: Some(manager.anchor.checkpoint_commit_oid.clone()),
+            })?;
+            recovered
+        }
+    };
     let changed_paths =
         crate::domain::delta::changed_path_count(&anchor_snapshot.entries, &snapshot.entries)
             as u32;
 
-    if let Some(hidden_commit_oid) = turn.pending_promotion_commit_oid.clone() {
-        if hidden_commit_oid == manager.anchor.checkpoint_commit_oid
-            && snapshot.fingerprint == manager.anchor.fingerprint
-        {
-            return finish_promotion_attempt(PromotionAttemptContext {
-                git: &git,
-                stores: &stores,
-                policy: &policy,
-                repo_state: &repo_state,
-                head: &head,
-                stream: &stream,
-                turn: &turn,
-                now,
-                hidden_commit_oid: &hidden_commit_oid,
-                expected_head_oid: turn.pending_promotion_head_oid.as_deref(),
-            });
-        }
-
-        turn.pending_promotion_commit_oid = None;
-        turn.pending_promotion_head_oid = None;
-        stores.turns.save(&turn)?;
-    }
-
-    let decision = classify(&ClassifyInput {
+    let decision = classify(&crate::domain::decision::ClassifyInput {
         stream_id_now: &stream.stream_id,
         stream_id_at_start: &turn.stream_id_at_start,
         now_unix: now,
-        anchor_fingerprint: &manager.anchor.fingerprint,
-        turn_baseline_fingerprint: &turn.baseline_fingerprint,
-        anchor_fingerprint_at_start: &turn.anchor_fingerprint_at_start,
-        current_fingerprint: &snapshot.fingerprint,
+        anchor_fingerprint: &manager.anchor.materialized_fingerprint,
+        turn_baseline_fingerprint: &turn.baseline_materialized_fingerprint,
+        anchor_fingerprint_at_start: &turn.anchor_materialized_fingerprint_at_start,
+        current_fingerprint: &snapshot.materialized_fingerprint,
         global_changed_paths: changed_paths,
         pending_turn_count: manager
             .pending
@@ -114,7 +141,7 @@ pub fn run(payload: &Value) -> Result<()> {
 
     let (outcome, source, commit_oid) = match decision {
         Decision::Noop(reason) => {
-            manager.pending = if reason == NoopReason::MatchesAnchor {
+            manager.pending = if reason == crate::domain::decision::NoopReason::MatchesAnchor {
                 None
             } else {
                 manager.pending
@@ -123,16 +150,13 @@ pub fn run(payload: &Value) -> Result<()> {
             stores.manager.save(&manager)?;
             stores.turns.delete(&turn.session_id, &turn.turn_id)?;
             let outcome = match reason {
-                NoopReason::MatchesAnchor => "matches-anchor",
-                NoopReason::MissingTurn => "missing-turn",
-                NoopReason::StreamChanged => "stream-changed",
+                crate::domain::decision::NoopReason::MatchesAnchor => "matches-anchor",
+                crate::domain::decision::NoopReason::MissingTurn => "missing-turn",
+                crate::domain::decision::NoopReason::StreamChanged => "stream-changed",
             };
             (outcome.to_string(), None, None)
         }
-        Decision::RecordPending {
-            source,
-            changed_paths: _,
-        } => {
+        Decision::RecordPending { source, .. } => {
             manager.pending = Some(reconcile_pending(
                 manager.pending.take(),
                 &turn.session_id,
@@ -145,74 +169,111 @@ pub fn run(payload: &Value) -> Result<()> {
             stores.turns.delete(&turn.session_id, &turn.turn_id)?;
             ("pending".to_string(), Some(source), None)
         }
-        Decision::Materialize {
-            source,
-            changed_paths: _,
-        } => {
-            let message = build_checkpoint_message(
-                &policy,
+        Decision::Materialize { source, .. } => {
+            let head_owned_paths = head
+                .oid
+                .as_deref()
+                .map(|oid| {
+                    git.list_head_owned_paths(oid, &policy.git_include_pathspecs())
+                        .map(|paths| {
+                            paths
+                                .into_iter()
+                                .filter(|path| policy.matches_owned_path(path))
+                                .collect::<Vec<_>>()
+                        })
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let message = build_checkpoint_message(CheckpointMessageContext {
+                subject: &policy.checkpoint_subject(),
+                generation: manager.generation + 1,
                 source,
-                &snapshot,
-                manager.generation + 1,
-                &head,
-                &stream,
-            );
-            let commit_oid = materialize_hidden_checkpoint(
+                snapshot: &snapshot,
+                head: &head,
+                stream: &stream,
+                policy_epoch: &policy.policy_epoch(),
+            });
+            let prepared = prepare_hidden_checkpoint(
                 &git,
                 head.oid.as_deref(),
-                &stream.hidden_ref,
                 Some(&manager.anchor.checkpoint_commit_oid),
+                &head_owned_paths,
                 &snapshot,
-                &policy,
                 &message,
             )?;
-            manager.generation += 1;
-            manager.anchor = crate::domain::manager::AnchorState {
-                checkpoint_commit_oid: commit_oid.clone(),
+            let intent = CheckpointIntent {
+                version: 1,
+                ts: now,
+                intent_id: Uuid::new_v4().to_string(),
+                stream_id: stream.stream_id.clone(),
+                hidden_ref: stream.hidden_ref.clone(),
+                checkpoint_commit_oid: prepared.commit_oid.clone(),
+                previous_hidden_oid: Some(manager.anchor.checkpoint_commit_oid.clone()),
                 manifest_id: snapshot.manifest_id.clone(),
-                fingerprint: snapshot.fingerprint.clone(),
+                materialized_fingerprint: snapshot.materialized_fingerprint.clone(),
+                observed_fingerprint: snapshot.observed_fingerprint.clone(),
+                policy_epoch: manager.anchor.policy_epoch.clone(),
+                stream_class: stream.class.clone(),
+                phase: IntentPhase::Prepared,
+            };
+            stores.intents.append(&intent)?;
+            stores.journal.append(&JournalEvent::IntentTransition {
+                ts: now,
+                stream_id: stream.stream_id.clone(),
+                intent_id: intent.intent_id.clone(),
+                checkpoint_commit_oid: prepared.commit_oid.clone(),
+                phase: IntentPhase::Prepared,
+            })?;
+            git.update_ref_cas(
+                &stream.hidden_ref,
+                &prepared.commit_oid,
+                Some(&manager.anchor.checkpoint_commit_oid),
+            )?;
+            stores.intents.append(&CheckpointIntent {
+                phase: IntentPhase::RefUpdated,
+                ..intent.clone()
+            })?;
+            stores.journal.append(&JournalEvent::IntentTransition {
+                ts: now,
+                stream_id: stream.stream_id.clone(),
+                intent_id: intent.intent_id.clone(),
+                checkpoint_commit_oid: prepared.commit_oid.clone(),
+                phase: IntentPhase::RefUpdated,
+            })?;
+
+            manager.generation += 1;
+            manager.anchor = AnchorState {
+                checkpoint_commit_oid: prepared.commit_oid.clone(),
+                manifest_id: snapshot.manifest_id.clone(),
+                materialized_fingerprint: snapshot.materialized_fingerprint.clone(),
+                observed_fingerprint: snapshot.observed_fingerprint.clone(),
+                policy_epoch: manager.anchor.policy_epoch.clone(),
+                stream_class: stream.class.clone(),
                 observed_head_oid: head.oid.clone(),
                 observed_head_ref: head.symref.clone(),
                 materialized_at: now,
             };
             manager.pending = None;
             manager.last_seen = Some(last_seen(&snapshot, now, &head));
+            stores.manifests.put(&snapshot.manifest_id, &snapshot)?;
             stores.manager.save(&manager)?;
-            turn.pending_promotion_commit_oid = Some(commit_oid.clone());
-            turn.pending_promotion_head_oid = head.oid.clone();
-            stores.turns.save(&turn)?;
-
-            match maybe_promote_visible(
-                &git,
-                &policy,
-                &repo_state,
-                &head,
-                head.oid.as_deref(),
-                &commit_oid,
-                &stream,
-            )? {
-                PromotionOutcome::Skipped(reason) => {
-                    stores.turns.delete(&turn.session_id, &turn.turn_id)?;
-                    stores.journal.append(&JournalEvent::PromotionSkipped {
-                        ts: now,
-                        stream_id: stream.stream_id.clone(),
-                        reason,
-                    })?;
-                    ("materialized".to_string(), Some(source), Some(commit_oid))
-                }
-                PromotionOutcome::Blocked(reason) => {
-                    emit_stop_block(&reason)?;
-                    (
-                        "materialized-blocked".to_string(),
-                        Some(source),
-                        Some(commit_oid),
-                    )
-                }
-                PromotionOutcome::Promoted(_) => {
-                    stores.turns.delete(&turn.session_id, &turn.turn_id)?;
-                    ("materialized".to_string(), Some(source), Some(commit_oid))
-                }
-            }
+            stores.intents.append(&CheckpointIntent {
+                phase: IntentPhase::Finalized,
+                ..intent.clone()
+            })?;
+            stores.journal.append(&JournalEvent::IntentTransition {
+                ts: now,
+                stream_id: stream.stream_id.clone(),
+                intent_id: intent.intent_id,
+                checkpoint_commit_oid: prepared.commit_oid.clone(),
+                phase: IntentPhase::Finalized,
+            })?;
+            stores.turns.delete(&turn.session_id, &turn.turn_id)?;
+            (
+                "materialized".to_string(),
+                Some(source),
+                Some(prepared.commit_oid),
+            )
         }
     };
 
@@ -228,71 +289,14 @@ pub fn run(payload: &Value) -> Result<()> {
     Ok(())
 }
 
-struct PromotionAttemptContext<'a> {
-    git: &'a dyn GitBackend,
-    stores: &'a Stores,
-    policy: &'a Policy,
-    repo_state: &'a crate::domain::session::RepoState,
-    head: &'a crate::domain::session::HeadState,
-    stream: &'a crate::domain::session::StreamIdentity,
-    turn: &'a crate::domain::turn::TurnState,
-    now: i64,
-    hidden_commit_oid: &'a str,
-    expected_head_oid: Option<&'a str>,
-}
-
-fn finish_promotion_attempt(ctx: PromotionAttemptContext<'_>) -> Result<()> {
-    let outcome = match maybe_promote_visible(
-        ctx.git,
-        ctx.policy,
-        ctx.repo_state,
-        ctx.head,
-        ctx.expected_head_oid,
-        ctx.hidden_commit_oid,
-        ctx.stream,
-    )? {
-        PromotionOutcome::Skipped(reason) => {
-            ctx.stores
-                .turns
-                .delete(&ctx.turn.session_id, &ctx.turn.turn_id)?;
-            ctx.stores.journal.append(&JournalEvent::PromotionSkipped {
-                ts: ctx.now,
-                stream_id: ctx.stream.stream_id.clone(),
-                reason,
-            })?;
-            "materialized".to_string()
-        }
-        PromotionOutcome::Blocked(reason) => {
-            emit_stop_block(&reason)?;
-            "materialized-blocked".to_string()
-        }
-        PromotionOutcome::Promoted(_) => {
-            ctx.stores
-                .turns
-                .delete(&ctx.turn.session_id, &ctx.turn.turn_id)?;
-            "materialized".to_string()
-        }
-    };
-
-    ctx.stores.journal.append(&JournalEvent::StopDecision {
-        ts: ctx.now,
-        session_id: ctx.turn.session_id.clone(),
-        turn_id: ctx.turn.turn_id.clone(),
-        stream_id: ctx.stream.stream_id.clone(),
-        outcome,
-        source: None,
-        commit_oid: Some(ctx.hidden_commit_oid.to_string()),
-    })?;
-    Ok(())
-}
-
 fn last_seen(
     snapshot: &crate::domain::manifest::StrictSnapshot,
     now: i64,
     head: &crate::domain::session::HeadState,
 ) -> Observation {
     Observation {
-        fingerprint: snapshot.fingerprint.clone(),
+        materialized_fingerprint: snapshot.materialized_fingerprint.clone(),
+        observed_fingerprint: snapshot.observed_fingerprint.clone(),
         manifest_id: snapshot.manifest_id.clone(),
         seen_at: now,
         observed_head_oid: head.oid.clone(),

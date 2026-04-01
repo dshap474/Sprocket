@@ -4,10 +4,11 @@ use anyhow::Result;
 use base64::Engine;
 use serde::{Serialize, de::DeserializeOwned};
 
+use crate::domain::intent::CheckpointIntent;
 use crate::domain::manager::ManagerState;
 use crate::domain::session::SessionState;
 use crate::domain::turn::TurnState;
-use crate::infra::atomic_write::{atomic_write_json, read_json};
+use crate::infra::atomic_write::{append_ndjson_line, atomic_write_json, read_json};
 use crate::infra::git::GitBackend;
 use crate::infra::journal_store::JournalStore;
 use crate::infra::manifest_store::ManifestStore;
@@ -17,6 +18,7 @@ pub struct RuntimeLayout {
     pub root: PathBuf,
     pub local_config_path: PathBuf,
     pub streams_root: PathBuf,
+    pub turns_root: PathBuf,
     pub lock_path: PathBuf,
 }
 
@@ -26,6 +28,7 @@ impl RuntimeLayout {
         Ok(Self {
             local_config_path: root.join("local.toml"),
             streams_root: root.join("streams"),
+            turns_root: root.join("turns"),
             lock_path: root.join("checkpoint.lock"),
             root,
         })
@@ -43,6 +46,7 @@ pub struct Stores {
     pub turns: TurnStore,
     pub sessions: SessionStore,
     pub manifests: ManifestStore,
+    pub intents: IntentStore,
     pub journal: JournalStore,
     pub lock_path: PathBuf,
 }
@@ -53,9 +57,10 @@ impl Stores {
         Self {
             lock_path: runtime.lock_path.clone(),
             manager: ManagerStore::new(&stream_root),
-            turns: TurnStore::new(&stream_root),
+            turns: TurnStore::new(&runtime.turns_root),
             sessions: SessionStore::new(&stream_root),
             manifests: ManifestStore::new(&stream_root),
+            intents: IntentStore::new(&stream_root),
             journal: JournalStore::new(&stream_root),
             runtime,
         }
@@ -84,6 +89,13 @@ impl ManagerStore {
     pub fn save(&self, manager: &ManagerState) -> Result<()> {
         atomic_write_json(&self.path, manager)
     }
+
+    pub fn delete(&self) -> Result<()> {
+        if self.path.exists() {
+            std::fs::remove_file(&self.path)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -92,9 +104,9 @@ pub struct TurnStore {
 }
 
 impl TurnStore {
-    pub fn new(stream_root: &Path) -> Self {
+    pub fn new(root: &Path) -> Self {
         Self {
-            root: stream_root.join("turns"),
+            root: root.to_path_buf(),
         }
     }
 
@@ -131,6 +143,34 @@ impl TurnStore {
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     root: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct IntentStore {
+    path: PathBuf,
+}
+
+impl IntentStore {
+    pub fn new(stream_root: &Path) -> Self {
+        Self {
+            path: stream_root.join("intents/events.ndjson"),
+        }
+    }
+
+    pub fn append(&self, intent: &CheckpointIntent) -> Result<()> {
+        append_ndjson_line(&self.path, intent)
+    }
+
+    pub fn load_all(&self) -> Result<Vec<CheckpointIntent>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        Ok(std::fs::read_to_string(&self.path)?
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
 }
 
 impl SessionStore {
