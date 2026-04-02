@@ -7,6 +7,7 @@ use sprocket::domain::intent::CheckpointIntent;
 use sprocket::domain::journal::JournalEvent;
 use sprocket::domain::manager::ManagerState;
 use sprocket::domain::manifest::StrictSnapshot;
+use sprocket::domain::session_tracker::SessionTracker;
 use sprocket::infra::atomic_write::{read_json, read_zstd_json};
 
 use super::repo::TestRepo;
@@ -53,6 +54,15 @@ pub fn hidden_ref_oid(repo: &TestRepo, refname: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+pub fn session_tracker_for_stream(stream_root: &Path, session_id: &str) -> SessionTracker {
+    read_json(
+        &stream_root
+            .join("session_trackers")
+            .join(format!("{}.json", encode_runtime_key(session_id))),
+    )
+    .unwrap()
 }
 
 pub fn read_journal(stream_root: &Path) -> Vec<JournalEvent> {

@@ -5,11 +5,12 @@ use crate::app::support::{
     RepoSupportContext, ensure_supported_repo, journal_lock_busy, load_policy,
 };
 use crate::cli::resolve_repo_from_target;
-use crate::codex::payload::{cwd, session_id, turn_id};
+use crate::codex::payload::{cwd, explicit_session_id, session_id, turn_id};
 use crate::domain::journal::JournalEvent;
 use crate::domain::turn::TurnState;
 use crate::engine::init_stream::{ensure_stream_initialized, refresh_session, resolve_stream};
 use crate::engine::observe::capture_strict_snapshot;
+use crate::engine::session_commit::refresh_active_sessions;
 use crate::infra::clock::{Clock, SystemClock};
 use crate::infra::git::GitBackend;
 use crate::infra::git_cli::GitCli;
@@ -47,17 +48,24 @@ pub fn run(payload: &Value) -> Result<()> {
         }
     };
 
-    let manager = ensure_stream_initialized(&git, &stores, &stream, &head, now, &policy)?;
+    let mut manager = ensure_stream_initialized(&git, &stores, &stream, &head, now, &policy)?;
     let snapshot = capture_strict_snapshot(git.repo_root(), &git, &policy)?;
     stores.manifests.put(&snapshot.manifest_id, &snapshot)?;
+    let session_id = session_id(payload);
+    let tracker_epoch = explicit_session_id(payload)
+        .and_then(|id| stores.session_trackers.load(id).ok().flatten())
+        .map(|tracker| tracker.epoch)
+        .unwrap_or(0);
 
     let turn = TurnState {
-        version: 3,
-        session_id: session_id(payload),
+        version: 4,
+        session_id: session_id.clone(),
         turn_id: turn_id(payload),
         stream_id_at_start: stream.stream_id.clone(),
         stream_class_at_start: stream.class.clone(),
         policy_epoch_at_start: policy.policy_epoch().0,
+        epoch_at_start: tracker_epoch,
+        head_oid_at_start: head.oid.clone(),
         started_at: now,
         baseline_materialized_fingerprint: snapshot.materialized_fingerprint.clone(),
         baseline_manifest_id: snapshot.manifest_id.clone(),
@@ -66,6 +74,8 @@ pub fn run(payload: &Value) -> Result<()> {
     };
     stores.turns.save(&turn)?;
     refresh_session(&stores, &turn.session_id, &stream.stream_id, now)?;
+    refresh_active_sessions(&stores, &mut manager, explicit_session_id(payload), now)?;
+    stores.manager.save(&manager)?;
     stores.journal.append(&JournalEvent::Baseline {
         ts: now,
         session_id: turn.session_id,

@@ -139,7 +139,7 @@ pub struct HiddenRefManagerInput<'a> {
 
 pub fn build_manager_from_hidden_ref(input: HiddenRefManagerInput<'_>) -> ManagerState {
     ManagerState {
-        version: 3,
+        version: 4,
         stream: input.stream.clone(),
         generation: input.generation,
         anchor: AnchorState {
@@ -161,6 +161,7 @@ pub fn build_manager_from_hidden_ref(input: HiddenRefManagerInput<'_>) -> Manage
             seen_at: input.now,
             observed_head_oid: input.observed_head_oid.clone(),
         }),
+        active_sessions: Vec::new(),
     }
 }
 

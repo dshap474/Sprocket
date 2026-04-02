@@ -6,18 +6,19 @@ use crate::app::support::{
     RepoSupportContext, ensure_supported_repo, journal_lock_busy, load_policy,
 };
 use crate::cli::resolve_repo_from_target;
-use crate::codex::payload::{cwd, session_id, turn_id};
+use crate::codex::payload::{cwd, explicit_session_id, session_id, turn_id};
 use crate::domain::decision::{Decision, classify};
 use crate::domain::intent::{CheckpointIntent, IntentPhase};
 use crate::domain::journal::JournalEvent;
 use crate::domain::manager::{AnchorState, reconcile_pending};
 use crate::domain::session::Observation;
-use crate::engine::init_stream::{ensure_stream_initialized, resolve_stream};
+use crate::engine::init_stream::{ensure_stream_initialized, refresh_session, resolve_stream};
 use crate::engine::materialize_hidden::{
     CheckpointMessageContext, build_checkpoint_message, prepare_hidden_checkpoint,
 };
 use crate::engine::observe::capture_strict_snapshot;
 use crate::engine::repair::snapshot_from_commit;
+use crate::engine::session_commit::{refresh_active_sessions, update_tracker_from_turn};
 use crate::infra::clock::{Clock, SystemClock};
 use crate::infra::failpoint::maybe_fail;
 use crate::infra::git::GitBackend;
@@ -57,8 +58,10 @@ pub fn run(payload: &Value) -> Result<()> {
         }
     };
 
+    let session_id = session_id(payload);
+    let turn_id = turn_id(payload);
     let mut manager = ensure_stream_initialized(&git, &stores, &stream, &head, now, &policy)?;
-    let Some(turn) = stores.turns.load(&session_id(payload), &turn_id(payload))? else {
+    let Some(turn) = stores.turns.load(&session_id, &turn_id)? else {
         return Ok(());
     };
 
@@ -113,6 +116,14 @@ pub fn run(payload: &Value) -> Result<()> {
             recovered
         }
     };
+    refresh_session(&stores, &session_id, &stream.stream_id, now)?;
+    if let Some(explicit_session_id) = explicit_session_id(payload)
+        && let Some(mut tracker) = stores.session_trackers.load(explicit_session_id)?
+    {
+        update_tracker_from_turn(&stores, &mut tracker, &turn, &snapshot, now)?;
+    }
+    refresh_active_sessions(&stores, &mut manager, explicit_session_id(payload), now)?;
+    stores.manager.save(&manager)?;
     let changed_paths =
         crate::domain::delta::changed_path_count(&anchor_snapshot.entries, &snapshot.entries)
             as u32;

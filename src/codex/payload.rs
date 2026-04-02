@@ -18,9 +18,13 @@ pub fn cwd(payload: &Value) -> Option<PathBuf> {
 }
 
 pub fn session_id(payload: &Value) -> String {
-    find_first_string(payload, &["session_id", "sessionId"])
+    explicit_session_id(payload)
         .unwrap_or("session-current")
         .to_string()
+}
+
+pub fn explicit_session_id(payload: &Value) -> Option<&str> {
+    find_first_string(payload, &["session_id", "sessionId"])
 }
 
 pub fn turn_id(payload: &Value) -> String {

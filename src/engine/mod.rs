@@ -5,3 +5,4 @@ pub mod observe;
 pub mod promote_visible;
 pub mod reconcile_pending;
 pub mod repair;
+pub mod session_commit;

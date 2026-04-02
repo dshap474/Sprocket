@@ -12,6 +12,7 @@ pub struct ManagerState {
     pub anchor: AnchorState,
     pub pending: Option<PendingEpisode>,
     pub last_seen: Option<Observation>,
+    pub active_sessions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

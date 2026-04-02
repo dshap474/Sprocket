@@ -10,6 +10,8 @@ pub struct TurnState {
     pub stream_id_at_start: String,
     pub stream_class_at_start: StreamClass,
     pub policy_epoch_at_start: String,
+    pub epoch_at_start: u32,
+    pub head_oid_at_start: Option<String>,
     pub started_at: i64,
     pub baseline_materialized_fingerprint: String,
     pub baseline_manifest_id: String,

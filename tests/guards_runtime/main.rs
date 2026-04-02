@@ -137,6 +137,20 @@ fn prepare_commit_msg_guard_and_pretool_guard_work() {
             .stdout_string()
             .contains("\"permissionDecision\":\"deny\"")
     );
+
+    let checkout = run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "pre-tool-use"],
+        Some(&payloads::pre_tool_use(&repo.root, "git checkout feature")),
+        &[],
+    );
+    checkout.assert_success();
+    assert!(
+        checkout
+            .stdout_string()
+            .contains("\"permissionDecision\":\"deny\"")
+    );
 }
 
 #[test]
@@ -285,4 +299,146 @@ fn payload_variants_are_accepted() {
         &[],
     )
     .assert_success();
+}
+
+#[test]
+fn plan_commit_blocks_unstable_session_id_and_head_movement() {
+    let repo = TestRepo::new();
+    repo.write("src/lib.rs", "pub fn a() {}\n");
+    repo.commit_all("init");
+
+    let unstable = run(
+        &repo.root,
+        &repo.hermetic,
+        &["session", "plan-commit", "--session-id", "session-current"],
+        None,
+        &[],
+    );
+    assert!(!unstable.output.status.success());
+    assert!(unstable.stderr_string().contains("stable session id"));
+
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "session-start"],
+        Some(&payloads::session_start(&repo.root, "s1")),
+        &[],
+    )
+    .assert_success();
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "baseline"],
+        Some(&payloads::baseline(&repo.root, "s1", "t1")),
+        &[],
+    )
+    .assert_success();
+    repo.write("src/lib.rs", "pub fn a() { println!(\"x\"); }\n");
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "checkpoint"],
+        Some(&payloads::checkpoint(&repo.root, "s1", "t1")),
+        &[],
+    )
+    .assert_success();
+    repo.write("README.md", "advance head\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "advance"]);
+
+    let plan = run(
+        &repo.root,
+        &repo.hermetic,
+        &["session", "plan-commit", "--session-id", "s1"],
+        None,
+        &[],
+    );
+    plan.assert_success();
+    let value: serde_json::Value = serde_json::from_str(&plan.stdout_string()).unwrap();
+    assert_eq!(value["safe_to_commit"], serde_json::json!(false));
+    assert!(
+        value["blocking_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "head_moved")
+    );
+}
+
+#[test]
+fn stale_sessions_do_not_poison_contention_detection() {
+    let repo = TestRepo::new();
+    repo.write("src/lib.rs", "pub fn a() {}\n");
+    repo.commit_all("init");
+
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "session-start"],
+        Some(&payloads::session_start(&repo.root, "stale")),
+        &[("SPROCKET_TEST_NOW", "100".to_string())],
+    )
+    .assert_success();
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "baseline"],
+        Some(&payloads::baseline(&repo.root, "stale", "t1")),
+        &[("SPROCKET_TEST_NOW", "110".to_string())],
+    )
+    .assert_success();
+    repo.write("src/lib.rs", "pub fn a() { println!(\"old\"); }\n");
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "checkpoint"],
+        Some(&payloads::checkpoint(&repo.root, "stale", "t1")),
+        &[("SPROCKET_TEST_NOW", "120".to_string())],
+    )
+    .assert_success();
+
+    repo.write("src/lib.rs", "pub fn a() {}\n");
+
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "session-start"],
+        Some(&payloads::session_start(&repo.root, "fresh")),
+        &[("SPROCKET_TEST_NOW", "8000".to_string())],
+    )
+    .assert_success();
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "baseline"],
+        Some(&payloads::baseline(&repo.root, "fresh", "t2")),
+        &[("SPROCKET_TEST_NOW", "8010".to_string())],
+    )
+    .assert_success();
+    repo.write("src/lib.rs", "pub fn a() { println!(\"fresh\"); }\n");
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "checkpoint"],
+        Some(&payloads::checkpoint(&repo.root, "fresh", "t2")),
+        &[("SPROCKET_TEST_NOW", "8020".to_string())],
+    )
+    .assert_success();
+
+    let plan = run(
+        &repo.root,
+        &repo.hermetic,
+        &["session", "plan-commit", "--session-id", "fresh"],
+        None,
+        &[("SPROCKET_TEST_NOW", "8030".to_string())],
+    );
+    plan.assert_success();
+    let value: serde_json::Value = serde_json::from_str(&plan.stdout_string()).unwrap();
+    assert!(
+        !value["blocking_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "path_contended")
+    );
 }

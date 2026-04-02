@@ -34,66 +34,14 @@ pub fn load_policy(
 }
 
 pub fn ensure_supported_repo(ctx: RepoSupportContext<'_>) -> Result<bool> {
-    if !ctx.policy.hidden_only_mode() {
-        journal_noop(
-            ctx.stores,
-            ctx.stream,
-            ctx.hook,
-            ctx.now,
-            "checkpoint-mode-unsupported",
-        )?;
-        return Ok(false);
-    }
-    if ctx.head.detached {
-        journal_noop(
-            ctx.stores,
-            ctx.stream,
-            ctx.hook,
-            ctx.now,
-            "detached-head-unsupported",
-        )?;
-        return Ok(false);
-    }
-    if let Some(reason) = ctx.repo_state.unsupported_reason() {
+    if let Some(reason) = unsupported_repo_reason(
+        ctx.git,
+        ctx.head,
+        ctx.repo_state,
+        ctx.policy,
+        ctx.git.repo_root(),
+    )? {
         journal_noop(ctx.stores, ctx.stream, ctx.hook, ctx.now, reason)?;
-        return Ok(false);
-    }
-    if ctx.repo_state.sparse_checkout {
-        journal_noop(
-            ctx.stores,
-            ctx.stream,
-            ctx.hook,
-            ctx.now,
-            "sparse-checkout-unsupported",
-        )?;
-        return Ok(false);
-    }
-    if let Some(oid) = ctx.head.oid.as_deref() {
-        let entries = ctx
-            .git
-            .list_tree_entries(oid, &ctx.policy.git_include_pathspecs())?
-            .into_iter()
-            .filter(|entry| ctx.policy.matches_owned_path(&entry.path))
-            .collect::<Vec<_>>();
-        if entries.iter().any(|entry| entry.kind == "commit") {
-            journal_noop(
-                ctx.stores,
-                ctx.stream,
-                ctx.hook,
-                ctx.now,
-                "gitlinks-unsupported",
-            )?;
-            return Ok(false);
-        }
-    }
-    if contains_gitattributes(ctx.git.repo_root())? {
-        journal_noop(
-            ctx.stores,
-            ctx.stream,
-            ctx.hook,
-            ctx.now,
-            "gitattributes-unsupported",
-        )?;
         return Ok(false);
     }
 
@@ -134,6 +82,41 @@ pub fn journal_lock_busy(
     now: i64,
 ) -> Result<()> {
     journal_noop(stores, stream, hook, now, "lock-busy")
+}
+
+pub fn unsupported_repo_reason(
+    git: &dyn GitBackend,
+    head: &HeadState,
+    repo_state: &RepoState,
+    policy: &Policy,
+    repo_root: &std::path::Path,
+) -> Result<Option<&'static str>> {
+    if !policy.hidden_only_mode() {
+        return Ok(Some("checkpoint-mode-unsupported"));
+    }
+    if head.detached {
+        return Ok(Some("detached-head-unsupported"));
+    }
+    if let Some(reason) = repo_state.unsupported_reason() {
+        return Ok(Some(reason));
+    }
+    if repo_state.sparse_checkout {
+        return Ok(Some("sparse-checkout-unsupported"));
+    }
+    if let Some(oid) = head.oid.as_deref() {
+        let entries = git
+            .list_tree_entries(oid, &policy.git_include_pathspecs())?
+            .into_iter()
+            .filter(|entry| policy.matches_owned_path(&entry.path))
+            .collect::<Vec<_>>();
+        if entries.iter().any(|entry| entry.kind == "commit") {
+            return Ok(Some("gitlinks-unsupported"));
+        }
+    }
+    if contains_gitattributes(repo_root)? {
+        return Ok(Some("gitattributes-unsupported"));
+    }
+    Ok(None)
 }
 
 fn contains_gitattributes(root: &std::path::Path) -> Result<bool> {

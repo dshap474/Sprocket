@@ -1,6 +1,7 @@
 #[path = "../support/mod.rs"]
 mod support;
 
+use serde_json::Value;
 use sprocket::domain::ids::compute_stream_identity;
 use sprocket::infra::git::GitBackend;
 use sprocket::infra::git_cli::GitCli;
@@ -8,7 +9,8 @@ use sprocket::infra::git_cli::GitCli;
 use sprocket::domain::intent::IntentPhase;
 
 use support::assertions::{
-    hidden_ref_oid, manager_for_stream, read_intents, read_journal, stream_root, turn_path,
+    hidden_ref_oid, manager_for_stream, read_intents, read_journal, session_tracker_for_stream,
+    stream_root, turn_path,
 };
 use support::cmd::run;
 use support::payloads;
@@ -65,6 +67,18 @@ lock_timeout_seconds = 300
         &[],
     )
     .assert_success();
+}
+
+fn plan_commit(repo: &TestRepo, session: &str, extra_env: &[(&str, String)]) -> Value {
+    let output = run(
+        &repo.root,
+        &repo.hermetic,
+        &["session", "plan-commit", "--session-id", session],
+        None,
+        extra_env,
+    );
+    output.assert_success();
+    serde_json::from_str(&output.stdout_string()).unwrap()
 }
 
 #[test]
@@ -693,4 +707,178 @@ fn cherry_pick_state_is_rejected_early() {
         sprocket::domain::journal::JournalEvent::HookNoop { reason, .. }
             if reason == "cherry-pick-in-progress"
     )));
+}
+
+#[test]
+fn session_start_creates_tracker_and_checkpoint_marks_exclusive_paths() {
+    let repo = TestRepo::new();
+    repo.write("src/lib.rs", "pub fn a() {}\n");
+    repo.commit_all("init");
+
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "session-start"],
+        Some(&payloads::session_start(&repo.root, "s1")),
+        &[],
+    )
+    .assert_success();
+
+    let stream = current_stream(&repo);
+    let tracker = session_tracker_for_stream(&stream_root(&repo, &stream.stream_id), "s1");
+    assert_eq!(tracker.epoch, 1);
+    assert!(tracker.touched_paths.is_empty());
+
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "baseline"],
+        Some(&payloads::baseline(&repo.root, "s1", "t1")),
+        &[],
+    )
+    .assert_success();
+    repo.write("src/lib.rs", "pub fn a() { println!(\"x\"); }\n");
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "checkpoint"],
+        Some(&payloads::checkpoint(&repo.root, "s1", "t1")),
+        &[],
+    )
+    .assert_success();
+
+    let tracker = session_tracker_for_stream(&stream_root(&repo, &stream.stream_id), "s1");
+    let path = sprocket::domain::repopath::RepoPath::from("src/lib.rs");
+    assert_eq!(tracker.turn_count_since_reset, 1);
+    assert_eq!(
+        tracker.touched_paths.get(&path).unwrap().claim_state,
+        sprocket::domain::session_tracker::PathClaimState::Exclusive
+    );
+
+    let plan = plan_commit(&repo, "s1", &[]);
+    assert_eq!(plan["safe_to_commit"], serde_json::json!(false));
+    assert_eq!(plan["thresholds_met"], serde_json::json!(false));
+    assert_eq!(plan["eligible_paths"], serde_json::json!(["src/lib.rs"]));
+}
+
+#[test]
+fn contended_paths_block_session_plan() {
+    let repo = TestRepo::new();
+    repo.write("src/lib.rs", "pub fn a() {}\n");
+    repo.commit_all("init");
+
+    for session in ["s1", "s2"] {
+        run(
+            &repo.root,
+            &repo.hermetic,
+            &["hook", "codex", "session-start"],
+            Some(&payloads::session_start(&repo.root, session)),
+            &[("SPROCKET_TEST_NOW", "100".to_string())],
+        )
+        .assert_success();
+    }
+
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "baseline"],
+        Some(&payloads::baseline(&repo.root, "s1", "t1")),
+        &[("SPROCKET_TEST_NOW", "110".to_string())],
+    )
+    .assert_success();
+    repo.write("src/lib.rs", "pub fn a() { println!(\"one\"); }\n");
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "checkpoint"],
+        Some(&payloads::checkpoint(&repo.root, "s1", "t1")),
+        &[("SPROCKET_TEST_NOW", "120".to_string())],
+    )
+    .assert_success();
+
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "baseline"],
+        Some(&payloads::baseline(&repo.root, "s2", "t2")),
+        &[("SPROCKET_TEST_NOW", "130".to_string())],
+    )
+    .assert_success();
+    repo.write("src/lib.rs", "pub fn a() { println!(\"two\"); }\n");
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "checkpoint"],
+        Some(&payloads::checkpoint(&repo.root, "s2", "t2")),
+        &[("SPROCKET_TEST_NOW", "140".to_string())],
+    )
+    .assert_success();
+
+    let plan = plan_commit(&repo, "s2", &[("SPROCKET_TEST_NOW", "150".to_string())]);
+    assert_eq!(plan["safe_to_commit"], serde_json::json!(false));
+    assert!(
+        plan["blocking_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "path_contended")
+    );
+    assert_eq!(plan["blocked_paths"][0]["path"], "src/lib.rs");
+}
+
+#[test]
+fn restored_paths_drop_out_of_the_final_candidate_set() {
+    let repo = TestRepo::new();
+    repo.write("src/lib.rs", "pub fn a() {}\n");
+    repo.commit_all("init");
+
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "session-start"],
+        Some(&payloads::session_start(&repo.root, "s1")),
+        &[],
+    )
+    .assert_success();
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "baseline"],
+        Some(&payloads::baseline(&repo.root, "s1", "t1")),
+        &[],
+    )
+    .assert_success();
+    repo.write("src/lib.rs", "pub fn a() { println!(\"x\"); }\n");
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "checkpoint"],
+        Some(&payloads::checkpoint(&repo.root, "s1", "t1")),
+        &[],
+    )
+    .assert_success();
+
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "baseline"],
+        Some(&payloads::baseline(&repo.root, "s1", "t2")),
+        &[],
+    )
+    .assert_success();
+    repo.write("src/lib.rs", "pub fn a() {}\n");
+    run(
+        &repo.root,
+        &repo.hermetic,
+        &["hook", "codex", "checkpoint"],
+        Some(&payloads::checkpoint(&repo.root, "s1", "t2")),
+        &[],
+    )
+    .assert_success();
+
+    let stream = current_stream(&repo);
+    let tracker = session_tracker_for_stream(&stream_root(&repo, &stream.stream_id), "s1");
+    assert!(tracker.touched_paths.is_empty());
+    let plan = plan_commit(&repo, "s1", &[]);
+    assert_eq!(plan["eligible_paths"], serde_json::json!([]));
 }

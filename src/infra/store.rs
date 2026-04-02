@@ -7,6 +7,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use crate::domain::intent::CheckpointIntent;
 use crate::domain::manager::ManagerState;
 use crate::domain::session::SessionState;
+use crate::domain::session_tracker::SessionTracker;
 use crate::domain::turn::TurnState;
 use crate::infra::atomic_write::{append_ndjson_line, atomic_write_json, read_json};
 use crate::infra::git::GitBackend;
@@ -45,6 +46,7 @@ pub struct Stores {
     pub manager: ManagerStore,
     pub turns: TurnStore,
     pub sessions: SessionStore,
+    pub session_trackers: SessionTrackerStore,
     pub manifests: ManifestStore,
     pub intents: IntentStore,
     pub journal: JournalStore,
@@ -59,6 +61,7 @@ impl Stores {
             manager: ManagerStore::new(&stream_root),
             turns: TurnStore::new(&runtime.turns_root),
             sessions: SessionStore::new(&stream_root),
+            session_trackers: SessionTrackerStore::new(&stream_root),
             manifests: ManifestStore::new(&stream_root),
             intents: IntentStore::new(&stream_root),
             journal: JournalStore::new(&stream_root),
@@ -146,6 +149,11 @@ pub struct SessionStore {
 }
 
 #[derive(Debug, Clone)]
+pub struct SessionTrackerStore {
+    root: PathBuf,
+}
+
+#[derive(Debug, Clone)]
 pub struct IntentStore {
     path: PathBuf,
 }
@@ -206,6 +214,54 @@ impl SessionStore {
     }
 }
 
+impl SessionTrackerStore {
+    pub fn new(stream_root: &Path) -> Self {
+        Self {
+            root: stream_root.join("session_trackers"),
+        }
+    }
+
+    pub fn load(&self, session_id: &str) -> Result<Option<SessionTracker>> {
+        let path = self.path(session_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(read_json(&path)?))
+    }
+
+    pub fn save(&self, tracker: &SessionTracker) -> Result<()> {
+        atomic_write_json(&self.path(&tracker.session_id), tracker)
+    }
+
+    pub fn delete(&self, session_id: &str) -> Result<()> {
+        let path = self.path(session_id);
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    pub fn list_all(&self) -> Result<Vec<SessionTracker>> {
+        if !self.root.exists() {
+            return Ok(Vec::new());
+        }
+        let mut trackers: Vec<SessionTracker> = Vec::new();
+        for entry in std::fs::read_dir(&self.root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                trackers.push(read_json(&entry.path())?);
+            }
+        }
+        trackers.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+        Ok(trackers)
+    }
+
+    fn path(&self, session_id: &str) -> PathBuf {
+        self.root
+            .join(format!("{}.json", encode_runtime_key(session_id)))
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LocalConfig {
     pub version: u32,
@@ -235,4 +291,26 @@ pub(crate) fn encode_runtime_key(value: &str) -> String {
         "k-{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.as_bytes())
     )
+}
+
+pub fn find_session_tracker(
+    runtime: &RuntimeLayout,
+    session_id: &str,
+) -> Result<Option<(String, SessionTracker)>> {
+    if !runtime.streams_root.exists() {
+        return Ok(None);
+    }
+    let encoded = format!("{}.json", encode_runtime_key(session_id));
+    for entry in std::fs::read_dir(&runtime.streams_root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let stream_id = entry.file_name().to_string_lossy().to_string();
+        let candidate = entry.path().join("session_trackers").join(&encoded);
+        if candidate.exists() {
+            return Ok(Some((stream_id, read_json(&candidate)?)));
+        }
+    }
+    Ok(None)
 }

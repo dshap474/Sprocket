@@ -2,9 +2,11 @@ use serde_json::json;
 
 use crate::codex::hooks_json::{group_contains_marker, merge_hooks_json};
 use crate::domain::decision::{ClassifyInput, Decision, classify};
+use crate::domain::delta::changed_paths;
 use crate::domain::ids::compute_stream_identity;
 use crate::domain::manager::{PendingSource, merge_pending_source, reconcile_pending};
 use crate::domain::manifest::StrictSnapshot;
+use crate::domain::session_tracker::{CommitBlockReason, SessionThresholdInput, thresholds_met};
 use crate::engine::classify::NoopReason;
 
 #[test]
@@ -136,4 +138,60 @@ fn prettool_guard_blocks_commit_but_not_status() {
     assert!(!crate::app::pre_tool_use::should_block_git_command(Some(
         "git status --short"
     )));
+    assert!(crate::app::pre_tool_use::should_block_git_command(Some(
+        "git checkout feature"
+    )));
+}
+
+#[test]
+fn changed_paths_returns_real_path_set() {
+    let old = vec![crate::domain::manifest::StrictEntry {
+        path: "src/lib.rs".into(),
+        mode: 0o100644,
+        observed_digest: "blake3:a".into(),
+        git_oid: "oid-a".into(),
+    }];
+    let new = vec![
+        crate::domain::manifest::StrictEntry {
+            path: "src/lib.rs".into(),
+            mode: 0o100644,
+            observed_digest: "blake3:b".into(),
+            git_oid: "oid-b".into(),
+        },
+        crate::domain::manifest::StrictEntry {
+            path: "README.md".into(),
+            mode: 0o100644,
+            observed_digest: "blake3:c".into(),
+            git_oid: "oid-c".into(),
+        },
+    ];
+    let changed = changed_paths(&old, &new);
+    assert!(changed.contains(&crate::domain::repopath::RepoPath::from("src/lib.rs")));
+    assert!(changed.contains(&crate::domain::repopath::RepoPath::from("README.md")));
+}
+
+#[test]
+fn session_thresholds_require_turns_files_or_age() {
+    assert!(!thresholds_met(&SessionThresholdInput {
+        turn_count_since_reset: 1,
+        exclusive_path_count: 1,
+        first_dirty_at: Some(100),
+        now_unix: 120,
+        turn_threshold: 2,
+        file_threshold: 4,
+        age_seconds: 60,
+    }));
+    assert!(thresholds_met(&SessionThresholdInput {
+        turn_count_since_reset: 2,
+        exclusive_path_count: 1,
+        first_dirty_at: Some(100),
+        now_unix: 120,
+        turn_threshold: 2,
+        file_threshold: 4,
+        age_seconds: 60,
+    }));
+    assert!(matches!(
+        CommitBlockReason::HeadMoved,
+        CommitBlockReason::HeadMoved
+    ));
 }

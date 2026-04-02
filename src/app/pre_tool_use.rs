@@ -23,11 +23,23 @@ pub(crate) fn should_block_git_command(command_text: Option<&str>) -> bool {
     };
     if matches!(
         subcommand,
-        "add" | "commit" | "merge" | "rebase" | "cherry-pick" | "push" | "tag" | "stash" | "am"
+        "add"
+            | "commit"
+            | "merge"
+            | "rebase"
+            | "cherry-pick"
+            | "push"
+            | "tag"
+            | "stash"
+            | "am"
+            | "checkout"
+            | "switch"
+            | "restore"
+            | "pull"
     ) {
         return true;
     }
-    subcommand == "reset" && argv.iter().any(|arg| arg == "--hard")
+    subcommand == "reset"
 }
 
 fn git_subcommand(argv: &[String]) -> Option<&str> {

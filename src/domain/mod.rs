@@ -9,5 +9,6 @@ pub mod manifest;
 pub mod policy;
 pub mod repopath;
 pub mod session;
+pub mod session_tracker;
 pub mod snapshot;
 pub mod turn;
